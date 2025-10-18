@@ -492,20 +492,25 @@ async function handleEvent(event) {
 
       if (isExcelScreenshot) {
         console.log('[OCR] Excel screenshot detected, performing OCR...');
-        const extractedText = await performOCR(imageBuffer, message.id);
+        const { extractedText, recordResult } = await performOCR(imageBuffer, message.id);
         console.log('[OCR] Extraction completed, text length:', extractedText.length);
 
-        const replyMessage = `This is an Excel screenshot!\n\nExtracted text:\n${extractedText.substring(0, 4000)}`;
+        // Only send reply if data was successfully recorded
+        if (recordResult && recordResult.success) {
+          const replyMessage = `Report for ${recordResult.date} has been recorded`;
 
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{
-            type: 'text',
-            text: replyMessage,
-          }],
-        });
+          await client.replyMessage({
+            replyToken: event.replyToken,
+            messages: [{
+              type: 'text',
+              text: replyMessage,
+            }],
+          });
 
-        console.log('OCR result sent to user');
+          console.log('Success message sent to user');
+        } else {
+          console.log('Data not recorded, no reply sent');
+        }
       } else {
         // Log failed detection - not an Excel screenshot
         await saveDetectionLog({
@@ -514,27 +519,13 @@ async function handleEvent(event) {
           status: 'failed',
           reason: 'Not an Excel screenshot (failed GPT-4 Vision detection)'
         });
-
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{
-            type: 'text',
-            text: 'This is an image, but not an Excel screenshot.',
-          }],
-        });
+        console.log('Image not detected as Excel screenshot, no reply sent');
       }
 
       console.log('Detection result:', { isExcelScreenshot });
     } catch (error) {
       console.error('Error processing image:', error);
-
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{
-          type: 'text',
-          text: 'Sorry, I encountered an error processing your image.',
-        }],
-      });
+      // Silent mode: don't reply on errors
     }
   } else {
     console.log('Non-image message received:', message.type);
@@ -650,8 +641,9 @@ async function performOCR(imageBuffer, messageId = 'unknown') {
     console.log('Tables found:', tableData.length);
 
     // Record daily data if conditions are met
+    let recordResult = null;
     try {
-      const recordResult = await recordDailyData(tableData, extractedText);
+      recordResult = await recordDailyData(tableData, extractedText);
       if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
         // Log successful extraction
@@ -684,7 +676,7 @@ async function performOCR(imageBuffer, messageId = 'unknown') {
       });
     }
 
-    return extractedText;
+    return { extractedText, recordResult };
   } catch (error) {
     console.error('Error in OCR:', error);
     throw error;

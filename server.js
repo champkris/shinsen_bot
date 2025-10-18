@@ -82,13 +82,36 @@ async function recordDailyData(tableData) {
     return null;
   }
 
-  // Extract date from table (assuming it's in R38C0 or first column)
-  const dateStr = table[38][0] ? table[38][0].toString().trim() : null;
+  // Extract date from top of table (usually in first few rows)
+  let dateStr = null;
+
+  // Search first 5 rows for date pattern (วันที่ DD/MM/YYYY)
+  for (let i = 0; i < Math.min(5, table.length); i++) {
+    const row = table[i];
+    if (!row) continue;
+
+    // Check all columns in this row
+    for (let col = 0; col < row.length; col++) {
+      const cellText = row[col] ? row[col].toString() : '';
+
+      // Look for date patterns like "วันที่ 18/10/2025" or "18/10/2025"
+      const dateMatch = cellText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (dateMatch) {
+        dateStr = dateMatch[1]; // Extract just the date part (DD/MM/YYYY)
+        console.log(`[DATE] Found date: ${dateStr} in row ${i}, column ${col}`);
+        break;
+      }
+    }
+
+    if (dateStr) break;
+  }
 
   if (!dateStr) {
-    console.log('No date found in R38C0');
+    console.log('[DATE] No date found in top of table');
     return null;
   }
+
+  console.log(`[DATE] Using date: ${dateStr}`);
 
   // Determine category (orange or yuzu) - you can modify this logic based on actual data
   // For now, we'll check if there's a category indicator in the table
@@ -152,26 +175,40 @@ async function recordDailyData(tableData) {
 
   console.log(`[RECORD] Calculating CDC totals for ${category} using column ${columnIndex}`);
 
-  // Iterate through table rows and sum values based on CDC name in column 1 or 2
+  // Iterate through table rows and sum values based on CDC name
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
 
-    // Check column 1 (index 1) for CDC location name
-    const locationCell = row[1] ? row[1].toString().trim() : '';
-
     // Find matching CDC name
     cdcNames.forEach(cdcName => {
-      if (locationCell.includes(cdcName)) {
-        const fullCdcName = cdcNameMapping[cdcName];
+      const fullCdcName = cdcNameMapping[cdcName];
 
-        // Get value from the appropriate column
+      // Determine which column to search based on CDC name
+      // If CDC name starts with "คลัง", search in C1 (column 1)
+      // Otherwise, search in C0 (column 0)
+      let searchColumnIndex;
+      let searchCell;
+
+      if (fullCdcName.startsWith('คลัง')) {
+        // Search in C1 for locations starting with "คลัง"
+        searchColumnIndex = 1;
+        searchCell = row[1] ? row[1].toString().trim() : '';
+      } else {
+        // Search in C0 for other locations
+        searchColumnIndex = 0;
+        searchCell = row[0] ? row[0].toString().trim() : '';
+      }
+
+      // Check if this row matches the CDC name
+      if (searchCell.includes(cdcName)) {
+        // Get value from the appropriate column (orange=C2, yuzu=C3)
         if (row[columnIndex]) {
           const cellValue = row[columnIndex].toString().replace(/,/g, '');
           const value = parseFloat(cellValue) || 0;
 
           if (value > 0) {
             cdcTotals[fullCdcName] += value;
-            console.log(`[RECORD] Row ${rowIndex}: ${locationCell} -> ${fullCdcName} += ${value} (total: ${cdcTotals[fullCdcName]})`);
+            console.log(`[RECORD] Row ${rowIndex}: C${searchColumnIndex}="${searchCell}" -> ${fullCdcName} += ${value} (total: ${cdcTotals[fullCdcName]})`);
           }
         }
       }
@@ -192,6 +229,55 @@ async function recordDailyData(tableData) {
 
   console.log(`Recorded daily data for ${dateStr} in ${category} category`);
   return { category, record: dailyRecord };
+}
+
+// Preprocess table data: fill down C0 and C1 values to handle merged cells
+function preprocessTableData(tableData) {
+  console.log('[PREPROCESS] Filling down C0 and C1 values...');
+
+  const processedTables = tableData.map(table => {
+    if (!table || table.length === 0) return table;
+
+    // Create a copy of the table
+    const processedTable = table.map(row => [...row]);
+
+    // Fill down column 0 (C0)
+    let lastC0Value = null;
+    for (let i = 0; i < processedTable.length; i++) {
+      if (processedTable[i] && processedTable[i][0]) {
+        const value = processedTable[i][0].toString().trim();
+        if (value) {
+          lastC0Value = value;
+        }
+      } else if (lastC0Value) {
+        // Fill down the last non-empty value
+        if (!processedTable[i]) processedTable[i] = [];
+        processedTable[i][0] = lastC0Value;
+        console.log(`[PREPROCESS] Row ${i} C0: filled with "${lastC0Value}"`);
+      }
+    }
+
+    // Fill down column 1 (C1)
+    let lastC1Value = null;
+    for (let i = 0; i < processedTable.length; i++) {
+      if (processedTable[i] && processedTable[i][1]) {
+        const value = processedTable[i][1].toString().trim();
+        if (value) {
+          lastC1Value = value;
+        }
+      } else if (lastC1Value) {
+        // Fill down the last non-empty value
+        if (!processedTable[i]) processedTable[i] = [];
+        processedTable[i][1] = lastC1Value;
+        console.log(`[PREPROCESS] Row ${i} C1: filled with "${lastC1Value}"`);
+      }
+    }
+
+    return processedTable;
+  });
+
+  console.log('[PREPROCESS] Fill down completed');
+  return processedTables;
 }
 
 // Detect category (orange or yuzu) from table data
@@ -390,6 +476,11 @@ async function performOCR(imageBuffer) {
       }
     }
 
+    // Preprocess table data: fill down C0 and C1 to help with extraction
+    if (tableData && tableData.length > 0) {
+      tableData = preprocessTableData(tableData);
+    }
+
     latestOCRResult = {
       timestamp: new Date(),
       extractedText: extractedText,
@@ -422,18 +513,49 @@ function transformTableData(tableData) {
     return null;
   }
 
-  const cdcMapping = {
-    'คลังบางบัวทอง': [3, 5, 7, 9, 11, 13, 38, 40, 42, 44, 45, 47, 49, 50, 52, 54, 56, 58],
-    'นครราชสีมา': [3, 5],
-    'นครสวรรค์': [7],
-    'ชลบุรี': [9, 11],
-    'คลังมหาชัย': [15],
-    'คลังสุวรรณภูมิ': [17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37],
-    'หาดใหญ่': [38, 40],
-    'ภูเก็ต': [42, 44],
-    'เชียงใหม่': [45, 47, 49],
-    'สุราษฎร์': [50, 52],
-    'ขอนแก่น': [54, 56, 58]
+  // Define CDC order (this will be the display order)
+  const cdcOrder = [
+    'คลังบางบัวทอง',
+    'นครราชสีมา',
+    'นครสวรรค์',
+    'ชลบุรี',
+    'คลังมหาชัย',
+    'คลังสุวรรณภูมิ',
+    'หาดใหญ่',
+    'ภูเก็ต',
+    'เชียงใหม่',
+    'สุราษฎร์',
+    'ขอนแก่น'
+  ];
+
+  // CDC names to search for (short names)
+  const cdcNames = [
+    'บางบัวทอง',
+    'นครราชสีมา',
+    'นครสวรรค์',
+    'ชลบุรี',
+    'มหาชัย',
+    'สุวรรณภูมิ',
+    'หาดใหญ่',
+    'ภูเก็ต',
+    'เชียงใหม่',
+    'สุราษฎร์',
+    'ขอนแก่น'
+  ];
+
+  // Map short names to full names
+  const cdcNameMapping = {
+    'บางบัวทอง': 'คลังบางบัวทอง',
+    'นครราชสีมา': 'นครราชสีมา',
+    'นครสวรรค์': 'นครสวรรค์',
+    'ชลบุรี': 'ชลบุรี',
+    'มหาชัย': 'คลังมหาชัย',
+    'สุวรรณภูมิ': 'คลังสุวรรณภูมิ',
+    'หาดใหญ่': 'หาดใหญ่',
+    'ภูเก็ต': 'ภูเก็ต',
+    'เชียงใหม่': 'เชียงใหม่',
+    'สุราษฎร์': 'สุราษฎร์',
+    'ขอนแก่น': 'ขอนแก่น'
   };
 
   const transformed = [];
@@ -441,22 +563,56 @@ function transformTableData(tableData) {
   if (tableData.length === 0) return transformed;
 
   const table = tableData[0];
+  const columnIndex = 2; // Orange column (C2)
 
-  Object.keys(cdcMapping).forEach(cdc => {
-    const rows = cdcMapping[cdc];
-    let sum = 0;
+  // Initialize totals for all CDC locations
+  const cdcTotals = {};
+  cdcOrder.forEach(cdc => {
+    cdcTotals[cdc] = 0;
+  });
 
-    rows.forEach(rowIndex => {
-      if (table[rowIndex] && table[rowIndex][2]) {
-        const cellValue = table[rowIndex][2].toString().replace(/,/g, '');
-        const value = parseFloat(cellValue) || 0;
-        sum += value;
+  // Iterate through table rows and sum values based on CDC name
+  table.forEach((row, rowIndex) => {
+    if (!row || row.length < 2) return;
+
+    // Find matching CDC name
+    cdcNames.forEach(cdcName => {
+      const fullCdcName = cdcNameMapping[cdcName];
+
+      // Determine which column to search based on CDC name
+      let searchColumnIndex;
+      let searchCell;
+
+      if (fullCdcName.startsWith('คลัง')) {
+        // Search in C1 for locations starting with "คลัง"
+        searchColumnIndex = 1;
+        searchCell = row[1] ? row[1].toString().trim() : '';
+      } else {
+        // Search in C0 for other locations
+        searchColumnIndex = 0;
+        searchCell = row[0] ? row[0].toString().trim() : '';
+      }
+
+      // Check if this row matches the CDC name
+      if (searchCell.includes(cdcName)) {
+        // Get value from column C2
+        if (row[columnIndex]) {
+          const cellValue = row[columnIndex].toString().replace(/,/g, '');
+          const value = parseFloat(cellValue) || 0;
+
+          if (value > 0) {
+            cdcTotals[fullCdcName] += value;
+          }
+        }
       }
     });
+  });
 
+  // Build transformed array in the defined order
+  cdcOrder.forEach(cdc => {
     transformed.push({
       cdc: cdc,
-      value: sum
+      value: cdcTotals[cdc]
     });
   });
 
@@ -869,19 +1025,19 @@ function generateDailyRecordsTable(records, category) {
     return '<div class="no-data">No records available for ' + category + '</div>';
   }
 
-  // Column headers matching CDC locations
+  // Column headers matching CDC locations (in proper order)
   const cdcColumns = [
     'คลังบางบัวทอง',
     'นครราชสีมา',
     'นครสวรรค์',
     'ชลบุรี',
+    'คลังมหาชัย',
+    'คลังสุวรรณภูมิ',
     'หาดใหญ่',
     'ภูเก็ต',
     'เชียงใหม่',
     'สุราษฎร์',
-    'ขอนแก่น',
-    'คลังมหาชัย',
-    'คลังสุวรรณภูมิ'
+    'ขอนแก่น'
   ];
 
   let html = '<div style="overflow-x: auto;"><table>';

@@ -497,7 +497,7 @@ async function handleEvent(event) {
 
         // Only send reply if data was successfully recorded
         if (recordResult && recordResult.success) {
-          const replyMessage = `Report for ${recordResult.date} has been recorded`;
+          const replyMessage = `Report for ${recordResult.date} has been recorded\n\nView report: https://shinsen.yushi-marketing.com/daily-report`;
 
           await client.replyMessage({
             replyToken: event.replyToken,

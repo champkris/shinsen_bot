@@ -36,6 +36,36 @@ let latestOCRResult = {
 };
 
 const DAILY_RECORDS_FILE = path.join(__dirname, 'daily_records.json');
+const DETECTION_LOGS_FILE = path.join(__dirname, 'detection_logs.json');
+
+// Load detection logs from file
+async function loadDetectionLogs() {
+  try {
+    const data = await fs.readFile(DETECTION_LOGS_FILE, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+}
+
+// Save detection log
+async function saveDetectionLog(logEntry) {
+  try {
+    const logs = await loadDetectionLogs();
+    logs.unshift(logEntry); // Add to beginning for chronological order
+
+    // Keep only last 100 logs
+    const trimmedLogs = logs.slice(0, 100);
+
+    await fs.writeFile(DETECTION_LOGS_FILE, JSON.stringify(trimmedLogs, null, 2), 'utf8');
+    console.log('[LOG] Detection log saved:', logEntry.status);
+  } catch (error) {
+    console.error('[LOG] Error saving detection log:', error);
+  }
+}
 
 // Load daily records from file
 async function loadDailyRecords() {
@@ -61,77 +91,96 @@ function isDateRecorded(records, date, category) {
 }
 
 // Record daily data if R38C2 is not 0
-async function recordDailyData(tableData) {
+async function recordDailyData(tableData, extractedText = '') {
   if (!tableData || tableData.length === 0) {
     console.log('No table data to record');
-    return null;
+    return { success: false, reason: 'No table data found' };
   }
 
   const table = tableData[0];
 
-  // Check if R38C2 exists and is not 0
-  if (!table[38] || !table[38][2]) {
-    console.log('R38C2 does not exist');
-    return null;
+  // Check if FC33 หาดใหญ่ C2 sum is not 0
+  let hadyaiSum = 0;
+  table.forEach((row, rowIndex) => {
+    if (!row || row.length < 3) return;
+
+    // Check C0 for FC33 หาดใหญ่
+    const c0Cell = row[0] ? row[0].toString().trim() : '';
+
+    if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
+      const c2Value = row[2] ? row[2].toString().replace(/,/g, '') : '0';
+      const value = parseFloat(c2Value) || 0;
+      hadyaiSum += value;
+      console.log(`[VALIDATION] Row ${rowIndex}: FC33 หาดใหญ่ found in C0, C2 value: ${value}`);
+    }
+  });
+
+  console.log(`[VALIDATION] FC33 หาดใหญ่ total sum in C2: ${hadyaiSum}`);
+
+  if (hadyaiSum === 0) {
+    console.log('[VALIDATION] FC33 หาดใหญ่ C2 sum is 0, not recording');
+    return { success: false, reason: 'FC33 หาดใหญ่ C2 sum is 0 (validation failed)' };
   }
 
-  const r38c2Value = parseFloat(table[38][2].toString().replace(/,/g, '')) || 0;
-
-  if (r38c2Value === 0) {
-    console.log('R38C2 is 0, not recording');
-    return null;
-  }
-
-  // Extract date from top of table (usually in first few rows)
+  // Extract date from table or extracted text
   let dateStr = null;
 
-  // Search first 5 rows for date pattern (วันที่ DD/MM/YYYY)
-  for (let i = 0; i < Math.min(5, table.length); i++) {
-    const row = table[i];
-    if (!row) continue;
+  // First, try to find date in the extracted text
+  if (extractedText) {
+    console.log('[DATE] Searching for date in extracted text...');
+    const textDateMatch = extractedText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
+    if (textDateMatch) {
+      dateStr = textDateMatch[1];
+      console.log(`[DATE] Found date in extracted text: ${dateStr}`);
+    }
+  }
 
-    // Check all columns in this row
-    for (let col = 0; col < row.length; col++) {
-      const cellText = row[col] ? row[col].toString() : '';
-
-      // Look for date patterns like "วันที่ 18/10/2025" or "18/10/2025"
-      const dateMatch = cellText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
-      if (dateMatch) {
-        dateStr = dateMatch[1]; // Extract just the date part (DD/MM/YYYY)
-        console.log(`[DATE] Found date: ${dateStr} in row ${i}, column ${col}`);
-        break;
-      }
+  // If not found in text, search in table
+  if (!dateStr) {
+    console.log('[DATE] Date not in extracted text, searching table...');
+    for (let i = 0; i < Math.min(5, table.length); i++) {
+      const row = table[i];
+      console.log(`[DATE] Row ${i}:`, row ? row.slice(0, 5) : 'undefined');
     }
 
-    if (dateStr) break;
+    // Search entire table for date pattern (วันที่ DD/MM/YYYY)
+    for (let i = 0; i < table.length; i++) {
+      const row = table[i];
+      if (!row) continue;
+
+      // Check all columns in this row
+      for (let col = 0; col < row.length; col++) {
+        const cellText = row[col] ? row[col].toString() : '';
+
+        // Look for date patterns like "วันที่ 18/10/2025" or "18/10/2025"
+        const dateMatch = cellText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
+        if (dateMatch) {
+          dateStr = dateMatch[1]; // Extract just the date part (DD/MM/YYYY)
+          console.log(`[DATE] Found date: ${dateStr} in row ${i}, column ${col}, cell: "${cellText}"`);
+          break;
+        }
+      }
+
+      if (dateStr) break;
+    }
   }
 
   if (!dateStr) {
-    console.log('[DATE] No date found in top of table');
-    return null;
+    console.log('[DATE] No date found in extracted text or table');
+    return { success: false, reason: 'No date found in table or extracted text' };
   }
 
   console.log(`[DATE] Using date: ${dateStr}`);
 
-  // Determine category (orange or yuzu) - you can modify this logic based on actual data
-  // For now, we'll check if there's a category indicator in the table
-  const category = detectCategory(table);
-
   const records = await loadDailyRecords();
 
-  // Check if this date is already recorded for this category
-  if (isDateRecorded(records, dateStr, category)) {
-    console.log(`Date ${dateStr} already recorded for ${category}`);
-    return null;
-  }
-
-  // Calculate CDC totals by searching for CDC names in the table (dynamic approach)
+  // Calculate CDC totals for both orange and yuzu
   const cdcConfig = {
     orange: {
-      column: 2, // Column index for orange data (0-indexed)
+      column: 2, // Column index for orange data (C2)
     },
     yuzu: {
-      column: 3, // Column index for yuzu data (0-indexed)
+      column: 3, // Column index for yuzu data (C3)
     }
   };
 
@@ -165,70 +214,159 @@ async function recordDailyData(tableData) {
     'ขอนแก่น': 'ขอนแก่น'
   };
 
-  const columnIndex = cdcConfig[category].column;
-  const cdcTotals = {};
+  const results = [];
 
-  // Initialize all CDC totals to 0
-  Object.values(cdcNameMapping).forEach(cdcFullName => {
-    cdcTotals[cdcFullName] = 0;
-  });
+  // Loop through both categories (orange and yuzu)
+  for (const category of ['orange', 'yuzu']) {
+    // Check if this date is already recorded for this category
+    if (isDateRecorded(records, dateStr, category)) {
+      console.log(`Date ${dateStr} already recorded for ${category}`);
+      continue;
+    }
 
-  console.log(`[RECORD] Calculating CDC totals for ${category} using column ${columnIndex}`);
+    const columnIndex = cdcConfig[category].column;
+    const cdcTotals = {};
+    let totalSum = 0;
 
-  // Iterate through table rows and sum values based on CDC name
-  table.forEach((row, rowIndex) => {
-    if (!row || row.length < 2) return;
+    // Initialize all CDC totals to 0
+    Object.values(cdcNameMapping).forEach(cdcFullName => {
+      cdcTotals[cdcFullName] = 0;
+    });
 
-    // Find matching CDC name
-    cdcNames.forEach(cdcName => {
-      const fullCdcName = cdcNameMapping[cdcName];
+    console.log(`[RECORD] Calculating CDC totals for ${category} using column ${columnIndex}`);
 
-      // Determine which column to search based on CDC name
-      // If CDC name starts with "คลัง", search in C1 (column 1)
-      // Otherwise, search in C0 (column 0)
-      let searchColumnIndex;
-      let searchCell;
+    // First, find the total sum from the table
+    // Look for a row containing "รวม" or "Total" in C0 or C1
+    console.log(`[TOTAL] Searching for total sum in ${table.length} rows for ${category}...`);
 
-      if (fullCdcName.startsWith('คลัง')) {
-        // Search in C1 for locations starting with "คลัง"
-        searchColumnIndex = 1;
-        searchCell = row[1] ? row[1].toString().trim() : '';
-      } else {
-        // Search in C0 for other locations
-        searchColumnIndex = 0;
-        searchCell = row[0] ? row[0].toString().trim() : '';
+    for (let i = 0; i < table.length; i++) {
+      const row = table[i];
+      if (!row || row.length < 2) continue;
+
+      const c0 = row[0] ? row[0].toString().trim() : '';
+      const c1 = row[1] ? row[1].toString().trim() : '';
+
+      // Log last few rows to debug
+      if (i >= table.length - 5) {
+        console.log(`[TOTAL] Row ${i}: C0="${c0}", C1="${c1}", C2="${row[2] || ''}", C3="${row[3] || ''}"`);
       }
 
-      // Check if this row matches the CDC name
-      if (searchCell.includes(cdcName)) {
-        // Get value from the appropriate column (orange=C2, yuzu=C3)
+      // Check if this row contains total indicator
+      // Check for various total indicators
+      const totalIndicators = ['ยอดรวม', 'รวม', 'total', 'grand total', 'sum'];
+      const foundTotal = totalIndicators.some(indicator =>
+        c0.toLowerCase().includes(indicator.toLowerCase()) || c1.toLowerCase().includes(indicator.toLowerCase())
+      );
+
+      if (foundTotal) {
+        // Extract the total sum from the appropriate column
         if (row[columnIndex]) {
           const cellValue = row[columnIndex].toString().replace(/,/g, '');
-          const value = parseFloat(cellValue) || 0;
+          totalSum = parseFloat(cellValue) || 0;
+          console.log(`[TOTAL] Found total sum for ${category}: ${totalSum} in row ${i} (C0="${c0}", C1="${c1}")`);
+          break;
+        }
+      }
+    }
 
-          if (value > 0) {
-            cdcTotals[fullCdcName] += value;
-            console.log(`[RECORD] Row ${rowIndex}: C${searchColumnIndex}="${searchCell}" -> ${fullCdcName} += ${value} (total: ${cdcTotals[fullCdcName]})`);
+    // If no total row found, calculate total by summing all values in the column
+    if (totalSum === 0) {
+      console.log(`[TOTAL] No ยอดรวม row found, calculating total by summing all values in column ${columnIndex}`);
+      for (let i = 0; i < table.length; i++) {
+        const row = table[i];
+        if (!row || !row[columnIndex]) continue;
+
+        const cellValue = row[columnIndex].toString().replace(/,/g, '').trim();
+        const value = parseFloat(cellValue) || 0;
+
+        if (value > 0) {
+          totalSum += value;
+        }
+      }
+      console.log(`[TOTAL] Calculated total sum for ${category}: ${totalSum}`);
+    }
+
+    // Iterate through table rows and sum values based on CDC name
+    table.forEach((row, rowIndex) => {
+      if (!row || row.length < 2) return;
+
+      // Find matching CDC name
+      cdcNames.forEach(cdcName => {
+        const fullCdcName = cdcNameMapping[cdcName];
+
+        // Determine which column to search based on CDC name
+        // If CDC name starts with "คลัง", search in C1 (column 1)
+        // Otherwise, search in C0 (column 0)
+        let searchColumnIndex;
+        let searchCell;
+
+        if (fullCdcName.startsWith('คลัง')) {
+          // Search in C1 for locations starting with "คลัง"
+          searchColumnIndex = 1;
+          searchCell = row[1] ? row[1].toString().trim() : '';
+        } else {
+          // Search in C0 for other locations
+          searchColumnIndex = 0;
+          searchCell = row[0] ? row[0].toString().trim() : '';
+        }
+
+        // Check if this row matches the CDC name
+        if (searchCell.includes(cdcName)) {
+          // Get value from the appropriate column (orange=C2, yuzu=C3)
+          if (row[columnIndex]) {
+            const cellValue = row[columnIndex].toString().replace(/,/g, '');
+            const value = parseFloat(cellValue) || 0;
+
+            if (value > 0) {
+              cdcTotals[fullCdcName] += value;
+              console.log(`[RECORD] Row ${rowIndex}: C${searchColumnIndex}="${searchCell}" -> ${fullCdcName} += ${value} (total: ${cdcTotals[fullCdcName]})`);
+            }
+          }
+        }
+      });
+    });
+
+    // For Orange category only: Extract ขอนแก่น Laos value from the last ขอนแก่น row
+    let khonKaenLaosValue = 0;
+    if (category === 'orange') {
+      // Find the last row containing ขอนแก่น in C0
+      for (let i = table.length - 1; i >= 0; i--) {
+        const row = table[i];
+        if (!row || !row[0]) continue;
+
+        const c0 = row[0].toString().trim();
+        if (c0.includes('ขอนแก่น')) {
+          // Extract value from C2 (column index 2)
+          if (row[2]) {
+            const cellValue = row[2].toString().replace(/,/g, '');
+            khonKaenLaosValue = parseFloat(cellValue) || 0;
+            console.log(`[LAOS] Found last ขอนแก่น row at index ${i}, C2 value: ${khonKaenLaosValue}`);
+            break;
           }
         }
       }
-    });
-  });
+    }
 
-  // Extract all relevant data from row 38
-  const dailyRecord = {
-    date: dateStr,
-    timestamp: new Date().toISOString(),
-    r38c2: r38c2Value,
-    cdcTotals: cdcTotals, // Store CDC totals
-    rowData: table[38] // Store entire row 38 data for reference
-  };
+    // Extract all relevant data
+    const dailyRecord = {
+      date: dateStr,
+      timestamp: new Date().toISOString(),
+      fc33HadyaiSum: hadyaiSum, // Store FC33 หาดใหญ่ validation value
+      totalSum: totalSum, // Store total sum from source table
+      cdcTotals: cdcTotals, // Store CDC totals
+      khonKaenLaos: category === 'orange' ? khonKaenLaosValue : undefined, // ขอนแก่น Laos (Orange only)
+      khonKaenCambodia: category === 'orange' ? 0 : undefined // ขอนแก่น Cambodia (Orange only, always 0 for now)
+    };
 
-  records[category].push(dailyRecord);
+    records[category].push(dailyRecord);
+    console.log(`Recorded daily data for ${dateStr} in ${category} category`);
+    results.push({ category, record: dailyRecord });
+  }
+
+  // Save all records at once
   await saveDailyRecords(records);
 
-  console.log(`Recorded daily data for ${dateStr} in ${category} category`);
-  return { category, record: dailyRecord };
+  return { success: true, date: dateStr, results: results };
 }
 
 // Preprocess table data: fill down C0 and C1 values to handle merged cells
@@ -272,6 +410,17 @@ function preprocessTableData(tableData) {
         console.log(`[PREPROCESS] Row ${i} C1: filled with "${lastC1Value}"`);
       }
     }
+
+    // Log all rows to verify table structure and identify the total row
+    console.log(`[PREPROCESS] Table has ${processedTable.length} rows after preprocessing`);
+    console.log('[PREPROCESS] All rows (first 4 columns):');
+    processedTable.forEach((row, idx) => {
+      const c0 = row[0] ? row[0].toString().substring(0, 30) : '';
+      const c1 = row[1] ? row[1].toString().substring(0, 30) : '';
+      const c2 = row[2] ? row[2].toString().substring(0, 15) : '';
+      const c3 = row[3] ? row[3].toString().substring(0, 15) : '';
+      console.log(`[PREPROCESS] Row ${idx}: C0="${c0}" | C1="${c1}" | C2="${c2}" | C3="${c3}"`);
+    });
 
     return processedTable;
   });
@@ -343,7 +492,7 @@ async function handleEvent(event) {
 
       if (isExcelScreenshot) {
         console.log('[OCR] Excel screenshot detected, performing OCR...');
-        const extractedText = await performOCR(imageBuffer);
+        const extractedText = await performOCR(imageBuffer, message.id);
         console.log('[OCR] Extraction completed, text length:', extractedText.length);
 
         const replyMessage = `This is an Excel screenshot!\n\nExtracted text:\n${extractedText.substring(0, 4000)}`;
@@ -358,6 +507,14 @@ async function handleEvent(event) {
 
         console.log('OCR result sent to user');
       } else {
+        // Log failed detection - not an Excel screenshot
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: message.id,
+          status: 'failed',
+          reason: 'Not an Excel screenshot (failed GPT-4 Vision detection)'
+        });
+
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
@@ -438,7 +595,7 @@ async function detectExcelScreenshot(imageBuffer) {
   }
 }
 
-async function performOCR(imageBuffer) {
+async function performOCR(imageBuffer, messageId = 'unknown') {
   try {
     console.log('Starting Azure OCR...');
 
@@ -485,7 +642,8 @@ async function performOCR(imageBuffer) {
       timestamp: new Date(),
       extractedText: extractedText,
       tableData: tableData,
-      rawResult: result
+      rawResult: result,
+      messageId: messageId
     };
 
     console.log('OCR completed. Text length:', extractedText.length);
@@ -493,12 +651,37 @@ async function performOCR(imageBuffer) {
 
     // Record daily data if conditions are met
     try {
-      const recordResult = await recordDailyData(tableData);
-      if (recordResult) {
+      const recordResult = await recordDailyData(tableData, extractedText);
+      if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
+        // Log successful extraction
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: latestOCRResult.messageId || 'unknown',
+          status: 'success',
+          date: recordResult.date,
+          categories: recordResult.results.map(r => r.category),
+          recordsCreated: recordResult.results.length
+        });
+      } else if (recordResult && !recordResult.success) {
+        console.log('Daily data not recorded:', recordResult.reason);
+        // Log failed extraction with reason
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: latestOCRResult.messageId || 'unknown',
+          status: 'failed',
+          reason: recordResult.reason
+        });
       }
     } catch (error) {
       console.error('Error recording daily data:', error);
+      // Log error
+      await saveDetectionLog({
+        timestamp: new Date().toISOString(),
+        messageId: latestOCRResult.messageId || 'unknown',
+        status: 'error',
+        reason: `Error: ${error.message}`
+      });
     }
 
     return extractedText;
@@ -508,7 +691,7 @@ async function performOCR(imageBuffer) {
   }
 }
 
-function transformTableData(tableData) {
+function transformTableData(tableData, columnIndex = 2) {
   if (!tableData || tableData.length === 0) {
     return null;
   }
@@ -563,7 +746,6 @@ function transformTableData(tableData) {
   if (tableData.length === 0) return transformed;
 
   const table = tableData[0];
-  const columnIndex = 2; // Orange column (C2)
 
   // Initialize totals for all CDC locations
   const cdcTotals = {};
@@ -595,7 +777,7 @@ function transformTableData(tableData) {
 
       // Check if this row matches the CDC name
       if (searchCell.includes(cdcName)) {
-        // Get value from column C2
+        // Get value from the specified column (C2 for orange, C3 for yuzu)
         if (row[columnIndex]) {
           const cellValue = row[columnIndex].toString().replace(/,/g, '');
           const value = parseFloat(cellValue) || 0;
@@ -646,21 +828,55 @@ function generateHTMLTable(tableData) {
   return html;
 }
 
-function generateTransformedTable(transformedData) {
+function generateTransformedTable(transformedData, category = 'น้ำส้ม') {
   if (!transformedData || transformedData.length === 0) {
-    return '<p>No transformed data available</p>';
+    return `<p>No transformed data available for ${category}</p>`;
   }
 
-  let html = '<style>table { border-collapse: collapse; width: 100%; margin: 20px 0; } th, td { border: 1px solid #ddd; padding: 8px; text-align: left; } th { background-color: #2196F3; color: white; } tr:nth-child(even) { background-color: #f2f2f2; }</style>';
+  const headerColor = category === 'น้ำส้ม' ? '#FF8C00' : '#FFD700';
+  const categoryLabel = category === 'น้ำส้ม' ? 'ขวดน้ำส้ม' : 'ขวดยูซุ';
 
+  let html = `<style>
+    .category-section { margin: 30px 0; }
+    .category-title {
+      font-size: 24px;
+      font-weight: bold;
+      color: ${headerColor};
+      margin-bottom: 15px;
+      padding: 10px;
+      background-color: ${headerColor}20;
+      border-radius: 5px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 20px 0;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    th {
+      background-color: ${headerColor};
+      color: white;
+    }
+    tr:nth-child(even) {
+      background-color: #f2f2f2;
+    }
+  </style>`;
+
+  html += `<div class="category-section">`;
+  html += `<div class="category-title">${category}</div>`;
   html += '<table>';
-  html += '<tr><th>CDC</th><th>ขวดน้ำส้ม</th></tr>';
+  html += `<tr><th>CDC</th><th>${categoryLabel}</th></tr>`;
 
   transformedData.forEach(item => {
     html += `<tr><td>${item.cdc}</td><td>${item.value}</td></tr>`;
   });
 
   html += '</table>';
+  html += '</div>';
 
   return html;
 }
@@ -741,8 +957,12 @@ app.get('/transformed-data', (req, res) => {
     return;
   }
 
-  const transformedData = transformTableData(latestOCRResult.tableData);
-  const transformedHTML = generateTransformedTable(transformedData);
+  // Transform data for both Orange (C2) and Yuzu (C3)
+  const orangeData = transformTableData(latestOCRResult.tableData, 2);
+  const yuzuData = transformTableData(latestOCRResult.tableData, 3);
+
+  const orangeHTML = generateTransformedTable(orangeData, 'น้ำส้ม');
+  const yuzuHTML = generateTransformedTable(yuzuData, 'ยูซุ');
 
   res.send(`
     <!DOCTYPE html>
@@ -768,10 +988,11 @@ app.get('/transformed-data', (req, res) => {
       <h1>Transformed Data (CDC Summary)</h1>
       <div class="info">
         <strong>Processed at:</strong> ${latestOCRResult.timestamp.toLocaleString()}<br>
-        <strong>CDC locations:</strong> ${transformedData ? transformedData.length : 0}
+        <strong>CDC locations:</strong> ${orangeData ? orangeData.length : 0}
       </div>
 
-      ${transformedHTML}
+      ${orangeHTML}
+      ${yuzuHTML}
     </body>
     </html>
   `);
@@ -781,8 +1002,36 @@ app.get('/daily-report', async (req, res) => {
   try {
     const records = await loadDailyRecords();
 
-    const orangeTableHTML = generateDailyRecordsTable(records.orange, 'Orange');
-    const yuzuTableHTML = generateDailyRecordsTable(records.yuzu, 'Yuzu');
+    // Get current date for default filter
+    const now = new Date();
+    const currentMonth = now.getMonth() + 1; // 1-12
+    const currentYear = now.getFullYear();
+
+    // Get filter parameters from query string (default to current month/year)
+    const selectedMonth = parseInt(req.query.month) || currentMonth;
+    const selectedYear = parseInt(req.query.year) || currentYear;
+
+    // Filter records by selected month and year
+    const filterByMonthYear = (recordsList) => {
+      if (!recordsList || recordsList.length === 0) return [];
+
+      return recordsList.filter(record => {
+        // Parse date in DD/MM/YYYY format
+        const dateParts = record.date.split('/');
+        if (dateParts.length !== 3) return false;
+
+        const recordMonth = parseInt(dateParts[1]);
+        const recordYear = parseInt(dateParts[2]);
+
+        return recordMonth === selectedMonth && recordYear === selectedYear;
+      });
+    };
+
+    const filteredOrange = filterByMonthYear(records.orange);
+    const filteredYuzu = filterByMonthYear(records.yuzu);
+
+    const orangeTableHTML = generateDailyRecordsTable(filteredOrange, 'Orange');
+    const yuzuTableHTML = generateDailyRecordsTable(filteredYuzu, 'Yuzu');
 
     res.send(`
       <!DOCTYPE html>
@@ -797,7 +1046,7 @@ app.get('/daily-report', async (req, res) => {
             background-color: #f5f5f5;
           }
           .container {
-            max-width: 1200px;
+            max-width: 100%;
             margin: 0 auto;
             background-color: white;
             padding: 20px;
@@ -930,6 +1179,34 @@ app.get('/daily-report', async (req, res) => {
             background-color: #ccc;
             cursor: not-allowed;
           }
+          .filter-section {
+            margin-bottom: 30px;
+            text-align: center;
+            padding: 20px;
+            background-color: #f0f0f0;
+            border-radius: 8px;
+          }
+          .filter-section label {
+            font-weight: bold;
+            font-size: 16px;
+            margin-right: 10px;
+          }
+          .filter-section select {
+            padding: 8px 15px;
+            font-size: 16px;
+            border: 2px solid #4CAF50;
+            border-radius: 5px;
+            background-color: white;
+            cursor: pointer;
+            transition: border-color 0.3s;
+          }
+          .filter-section select:hover {
+            border-color: #45a049;
+          }
+          .filter-section select:focus {
+            outline: none;
+            border-color: #2196F3;
+          }
         </style>
       </head>
       <body>
@@ -938,6 +1215,7 @@ app.get('/daily-report', async (req, res) => {
             <a href="/latest-ocr">Original Table</a>
             <a href="/transformed-data">Transformed Data</a>
             <a href="/daily-report">Daily Report</a>
+            <a href="/detection-logs">Detection Logs</a>
           </div>
 
           <h1>📊 Daily Records Report</h1>
@@ -946,17 +1224,42 @@ app.get('/daily-report', async (req, res) => {
             <button class="btn-clear" onclick="clearAllRecords()">🗑️ Clear All Records</button>
           </div>
 
+          <div class="filter-section">
+            <label for="month-filter">Month:</label>
+            <select id="month-filter" onchange="applyFilter()">
+              <option value="1" ${selectedMonth === 1 ? 'selected' : ''}>January</option>
+              <option value="2" ${selectedMonth === 2 ? 'selected' : ''}>February</option>
+              <option value="3" ${selectedMonth === 3 ? 'selected' : ''}>March</option>
+              <option value="4" ${selectedMonth === 4 ? 'selected' : ''}>April</option>
+              <option value="5" ${selectedMonth === 5 ? 'selected' : ''}>May</option>
+              <option value="6" ${selectedMonth === 6 ? 'selected' : ''}>June</option>
+              <option value="7" ${selectedMonth === 7 ? 'selected' : ''}>July</option>
+              <option value="8" ${selectedMonth === 8 ? 'selected' : ''}>August</option>
+              <option value="9" ${selectedMonth === 9 ? 'selected' : ''}>September</option>
+              <option value="10" ${selectedMonth === 10 ? 'selected' : ''}>October</option>
+              <option value="11" ${selectedMonth === 11 ? 'selected' : ''}>November</option>
+              <option value="12" ${selectedMonth === 12 ? 'selected' : ''}>December</option>
+            </select>
+
+            <label for="year-filter" style="margin-left: 20px;">Year:</label>
+            <select id="year-filter" onchange="applyFilter()">
+              <option value="2024" ${selectedYear === 2024 ? 'selected' : ''}>2024</option>
+              <option value="2025" ${selectedYear === 2025 ? 'selected' : ''}>2025</option>
+              <option value="2026" ${selectedYear === 2026 ? 'selected' : ''}>2026</option>
+            </select>
+          </div>
+
           <div class="summary">
             <div class="summary-card">
-              <div class="summary-number">${records.orange.length}</div>
+              <div class="summary-number">${filteredOrange.length}</div>
               <div class="summary-label">Orange Records</div>
             </div>
             <div class="summary-card">
-              <div class="summary-number">${records.yuzu.length}</div>
+              <div class="summary-number">${filteredYuzu.length}</div>
               <div class="summary-label">Yuzu Records</div>
             </div>
             <div class="summary-card">
-              <div class="summary-number">${records.orange.length + records.yuzu.length}</div>
+              <div class="summary-number">${filteredOrange.length + filteredYuzu.length}</div>
               <div class="summary-label">Total Records</div>
             </div>
           </div>
@@ -977,6 +1280,12 @@ app.get('/daily-report', async (req, res) => {
         </div>
 
         <script>
+          function applyFilter() {
+            const month = document.getElementById('month-filter').value;
+            const year = document.getElementById('year-filter').value;
+            window.location.href = '/daily-report?month=' + month + '&year=' + year;
+          }
+
           async function clearAllRecords() {
             if (!confirm('Are you sure you want to clear all records? This action cannot be undone.')) {
               return;
@@ -1025,19 +1334,30 @@ function generateDailyRecordsTable(records, category) {
     return '<div class="no-data">No records available for ' + category + '</div>';
   }
 
+  // Sort records by date in ascending order
+  const sortedRecords = [...records].sort((a, b) => {
+    // Parse DD/MM/YYYY format
+    const parseDate = (dateStr) => {
+      const [day, month, year] = dateStr.split('/').map(Number);
+      return new Date(year, month - 1, day);
+    };
+
+    return parseDate(a.date) - parseDate(b.date);
+  });
+
   // Column headers matching CDC locations (in proper order)
   const cdcColumns = [
     'คลังบางบัวทอง',
     'นครราชสีมา',
     'นครสวรรค์',
     'ชลบุรี',
-    'คลังมหาชัย',
-    'คลังสุวรรณภูมิ',
     'หาดใหญ่',
     'ภูเก็ต',
     'เชียงใหม่',
     'สุราษฎร์',
-    'ขอนแก่น'
+    'ขอนแก่น',
+    'คลังมหาชัย',
+    'คลังสุวรรณภูมิ'
   ];
 
   let html = '<div style="overflow-x: auto;"><table>';
@@ -1053,13 +1373,17 @@ function generateDailyRecordsTable(records, category) {
       html += `<th>${header}</th>`;
     }
   });
+
+  // Add special columns for Orange category only
+  if (category.toLowerCase() === 'orange') {
+    html += '<th style="background-color: #FF9800;">ขอนแก่น<br>Laos<br>4 สาขา</th>';
+    html += '<th style="background-color: #FF9800;">ขอนแก่น<br>Cambodia<br>85 สาขา</th>';
+  }
+
+  html += '<th style="background-color: #4CAF50;">รวม</th>'; // Total sum column
   html += '<th style="background-color: #9c27b0;">Recorded At</th></tr>';
 
-  // Sort by date (most recent first)
-  const sortedRecords = [...records].sort((a, b) => {
-    return new Date(b.timestamp) - new Date(a.timestamp);
-  });
-
+  // Use the already sorted records (by date ascending)
   sortedRecords.forEach(record => {
     const recordedDate = new Date(record.timestamp).toLocaleString('th-TH', {
       year: 'numeric',
@@ -1093,6 +1417,24 @@ function generateDailyRecordsTable(records, category) {
         html += '<td>-</td>';
       });
     }
+
+    // Add special columns for Orange category only
+    if (category.toLowerCase() === 'orange') {
+      // ขอนแก่น Laos column
+      const laosValue = record.khonKaenLaos || 0;
+      const formattedLaos = laosValue.toLocaleString('en-US');
+      html += `<td style="background-color: #FFE0B2; font-weight: bold;">${formattedLaos}</td>`;
+
+      // ขอนแก่น Cambodia column (always blank/0)
+      const cambodiaValue = record.khonKaenCambodia || 0;
+      const formattedCambodia = cambodiaValue.toLocaleString('en-US');
+      html += `<td style="background-color: #FFE0B2;">${formattedCambodia}</td>`;
+    }
+
+    // Total sum column
+    const totalValue = record.totalSum || 0;
+    const formattedTotal = totalValue.toLocaleString('en-US');
+    html += `<td style="background-color: #c8e6c9; font-weight: bold;">${formattedTotal}</td>`;
 
     // Recorded timestamp
     html += `<td style="background-color: #f3e5f5; font-size: 0.9em;">${recordedDate}</td>`;
@@ -1214,6 +1556,7 @@ app.get('/test', (req, res) => {
         <a href="/latest-ocr">Original Table</a>
         <a href="/transformed-data">Transformed Data</a>
         <a href="/daily-report">Daily Report</a>
+        <a href="/detection-logs">Detection Logs</a>
         <a href="/test">Test OCR</a>
       </div>
 
@@ -1315,6 +1658,217 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// Detection logs endpoint
+app.get('/detection-logs', async (req, res) => {
+  try {
+    const logs = await loadDetectionLogs();
+
+    let logsHTML = '';
+    if (logs.length === 0) {
+      logsHTML = '<tr><td colspan="4" class="no-data">No detection logs yet</td></tr>';
+    } else {
+      logs.forEach(log => {
+        const timestamp = new Date(log.timestamp).toLocaleString('en-US', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        });
+
+        const statusIcon = log.status === 'success' ? '✅' : log.status === 'failed' ? '❌' : '⚠️';
+        const statusClass = log.status === 'success' ? 'status-success' : log.status === 'failed' ? 'status-failed' : 'status-error';
+        const statusText = log.status === 'success' ? 'Success' : log.status === 'failed' ? 'Failed' : 'Error';
+
+        let detailsHTML = '';
+        if (log.status === 'success') {
+          detailsHTML = `<strong>Date:</strong> ${log.date || 'N/A'}<br>
+                         <strong>Categories:</strong> ${log.categories ? log.categories.join(', ') : 'N/A'}<br>
+                         <strong>Records Created:</strong> ${log.recordsCreated || 0}`;
+        } else {
+          detailsHTML = `<strong>Reason:</strong> ${log.reason || 'Unknown'}`;
+        }
+
+        logsHTML += `
+          <tr>
+            <td>${timestamp}</td>
+            <td><code>${log.messageId || 'unknown'}</code></td>
+            <td class="${statusClass}">${statusIcon} ${statusText}</td>
+            <td class="details">${detailsHTML}</td>
+          </tr>
+        `;
+      });
+    }
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Detection Logs</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+          }
+          .container {
+            max-width: 100%;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+          }
+          h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+          }
+          .nav {
+            margin-bottom: 20px;
+            text-align: center;
+          }
+          .nav a {
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            text-decoration: none;
+            margin: 0 5px;
+            border-radius: 5px;
+            display: inline-block;
+          }
+          .nav a:hover {
+            background-color: #45a049;
+          }
+          table {
+            border-collapse: collapse;
+            width: 100%;
+            background-color: white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+          }
+          th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+          }
+          th {
+            background-color: #2196F3;
+            color: white;
+            font-weight: bold;
+          }
+          tr:nth-child(even) {
+            background-color: #f9f9f9;
+          }
+          tr:hover {
+            background-color: #f1f1f1;
+          }
+          .status-success {
+            color: #4CAF50;
+            font-weight: bold;
+          }
+          .status-failed {
+            color: #f44336;
+            font-weight: bold;
+          }
+          .status-error {
+            color: #ff9800;
+            font-weight: bold;
+          }
+          .details {
+            font-size: 14px;
+            line-height: 1.6;
+          }
+          .no-data {
+            padding: 40px;
+            text-align: center;
+            color: #666;
+            font-style: italic;
+          }
+          code {
+            background-color: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            font-size: 12px;
+          }
+          .summary {
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+          }
+          .summary-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            min-width: 150px;
+            text-align: center;
+            margin: 10px;
+          }
+          .summary-number {
+            font-size: 36px;
+            font-weight: bold;
+          }
+          .summary-label {
+            font-size: 14px;
+            opacity: 0.9;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="nav">
+            <a href="/latest-ocr">Original Table</a>
+            <a href="/transformed-data">Transformed Data</a>
+            <a href="/daily-report">Daily Report</a>
+            <a href="/detection-logs">Detection Logs</a>
+          </div>
+
+          <h1>📋 Image Detection Logs</h1>
+
+          <div class="summary">
+            <div class="summary-card" style="background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);">
+              <div class="summary-number">${logs.filter(l => l.status === 'success').length}</div>
+              <div class="summary-label">Successful</div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);">
+              <div class="summary-number">${logs.filter(l => l.status === 'failed').length}</div>
+              <div class="summary-label">Failed</div>
+            </div>
+            <div class="summary-card" style="background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);">
+              <div class="summary-number">${logs.filter(l => l.status === 'error').length}</div>
+              <div class="summary-label">Errors</div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-number">${logs.length}</div>
+              <div class="summary-label">Total Logs</div>
+            </div>
+          </div>
+
+          <table>
+            <tr>
+              <th>Timestamp</th>
+              <th>Message ID</th>
+              <th>Status</th>
+              <th>Details</th>
+            </tr>
+            ${logsHTML}
+          </table>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('Error loading detection logs:', error);
+    res.status(500).send('Error loading detection logs');
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`LINE Bot server is running on port ${PORT}`);
   console.log(`Webhook URL: http://localhost:${PORT}/webhook`);

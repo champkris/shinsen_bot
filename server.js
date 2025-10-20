@@ -295,13 +295,18 @@ async function recordDailyData(tableData, extractedText = '') {
         const fullCdcName = cdcNameMapping[cdcName];
 
         // Determine which column to search based on CDC name
-        // If CDC name starts with "คลัง", search in C1 (column 1)
-        // Otherwise, search in C0 (column 0)
+        // Exception: "คลังบางบัวทอง" searches in C0 (looks for "FC01 บางบัวทอง" or similar)
+        // Other "คลัง" prefixed names search in C1
+        // All other locations search in C0
         let searchColumnIndex;
         let searchCell;
 
-        if (fullCdcName.startsWith('คลัง')) {
-          // Search in C1 for locations starting with "คลัง"
+        if (fullCdcName === 'คลังบางบัวทอง') {
+          // Exception: บางบัวทอง searches in C0 for "FC01 บางบัวทอง" or similar
+          searchColumnIndex = 0;
+          searchCell = row[0] ? row[0].toString().trim() : '';
+        } else if (fullCdcName.startsWith('คลัง')) {
+          // Search in C1 for other locations starting with "คลัง" (มหาชัย, สุวรรณภูมิ)
           searchColumnIndex = 1;
           searchCell = row[1] ? row[1].toString().trim() : '';
         } else {

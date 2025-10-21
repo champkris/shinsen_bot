@@ -1155,27 +1155,6 @@ app.get('/daily-report', async (req, res) => {
             font-size: 14px;
             opacity: 0.9;
           }
-          .action-buttons {
-            margin-bottom: 20px;
-            text-align: center;
-          }
-          .btn-clear {
-            padding: 12px 24px;
-            background-color: #f44336;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-            transition: background-color 0.3s;
-          }
-          .btn-clear:hover {
-            background-color: #d32f2f;
-          }
-          .btn-clear:disabled {
-            background-color: #ccc;
-            cursor: not-allowed;
-          }
           .filter-section {
             margin-bottom: 30px;
             text-align: center;
@@ -1216,10 +1195,6 @@ app.get('/daily-report', async (req, res) => {
           </div>
 
           <h1>📊 Daily Records Report</h1>
-
-          <div class="action-buttons">
-            <button class="btn-clear" onclick="clearAllRecords()">🗑️ Clear All Records</button>
-          </div>
 
           <div class="filter-section">
             <label for="month-filter">Month:</label>
@@ -1281,40 +1256,6 @@ app.get('/daily-report', async (req, res) => {
             const month = document.getElementById('month-filter').value;
             const year = document.getElementById('year-filter').value;
             window.location.href = '/daily-report?month=' + month + '&year=' + year;
-          }
-
-          async function clearAllRecords() {
-            if (!confirm('Are you sure you want to clear all records? This action cannot be undone.')) {
-              return;
-            }
-
-            const button = document.querySelector('.btn-clear');
-            button.disabled = true;
-            button.textContent = 'Clearing...';
-
-            try {
-              const response = await fetch('/clear-records', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json'
-                }
-              });
-
-              const result = await response.json();
-
-              if (result.success) {
-                alert('All records cleared successfully!');
-                window.location.reload();
-              } else {
-                alert('Failed to clear records: ' + result.error);
-                button.disabled = false;
-                button.textContent = '🗑️ Clear All Records';
-              }
-            } catch (error) {
-              alert('Error clearing records: ' + error.message);
-              button.disabled = false;
-              button.textContent = '🗑️ Clear All Records';
-            }
           }
         </script>
       </body>
@@ -1441,18 +1382,6 @@ function generateDailyRecordsTable(records, category) {
   html += '</table></div>';
   return html;
 }
-
-app.post('/clear-records', async (req, res) => {
-  try {
-    const emptyRecords = { orange: [], yuzu: [] };
-    await saveDailyRecords(emptyRecords);
-    console.log('[CLEAR] All records cleared successfully');
-    res.json({ success: true, message: 'All records cleared successfully' });
-  } catch (error) {
-    console.error('[ERROR] Error clearing records:', error);
-    res.status(500).json({ success: false, error: 'Failed to clear records' });
-  }
-});
 
 // Test endpoint for uploading images directly (bypass LINE webhook)
 app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (req, res) => {

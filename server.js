@@ -38,6 +38,13 @@ let latestOCRResult = {
 const DAILY_RECORDS_FILE = path.join(__dirname, 'daily_records.json');
 const DETECTION_LOGS_FILE = path.join(__dirname, 'detection_logs.json');
 
+// Notification group IDs (comma-separated in .env)
+const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
+  ? process.env.NOTIFICATION_GROUP_IDS.split(',').map(id => id.trim()).filter(id => id)
+  : [];
+
+console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
+
 // Load detection logs from file
 async function loadDetectionLogs() {
   try {
@@ -83,6 +90,31 @@ async function loadDailyRecords() {
 // Save daily records to file
 async function saveDailyRecords(records) {
   await fs.writeFile(DAILY_RECORDS_FILE, JSON.stringify(records, null, 2), 'utf8');
+}
+
+// Send notification to configured groups about data update
+async function sendNotificationToGroups(date, categories) {
+  if (NOTIFICATION_GROUP_IDS.length === 0) {
+    console.log('[NOTIFICATION] No notification groups configured');
+    return;
+  }
+
+  const message = `Report for ${date} has been recorded\n\nCategories: ${categories.join(', ')}\n\nView report: https://shinsen.yushi-marketing.com/daily-report`;
+
+  for (const groupId of NOTIFICATION_GROUP_IDS) {
+    try {
+      await client.pushMessage({
+        to: groupId,
+        messages: [{
+          type: 'text',
+          text: message,
+        }],
+      });
+      console.log(`[NOTIFICATION] Sent notification to group: ${groupId}`);
+    } catch (error) {
+      console.error(`[NOTIFICATION] Failed to send to group ${groupId}:`, error.message);
+    }
+  }
 }
 
 // Check if date already exists in records
@@ -475,6 +507,17 @@ app.use(express.json());
 async function handleEvent(event) {
   console.log('[EVENT] Event type:', event.type);
 
+  // Log source information (group ID, user ID, etc.)
+  if (event.source) {
+    console.log('[EVENT] Source type:', event.source.type);
+    if (event.source.groupId) {
+      console.log('[EVENT] Group ID:', event.source.groupId);
+    }
+    if (event.source.userId) {
+      console.log('[EVENT] User ID:', event.source.userId);
+    }
+  }
+
   if (event.type !== 'message') {
     console.log('[EVENT] Skipping non-message event');
     return null;
@@ -513,6 +556,10 @@ async function handleEvent(event) {
           });
 
           console.log('Success message sent to user');
+
+          // Send notifications to configured groups
+          const categories = recordResult.results.map(r => r.category);
+          await sendNotificationToGroups(recordResult.date, categories);
         } else {
           console.log('Data not recorded, no reply sent');
         }

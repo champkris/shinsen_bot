@@ -587,17 +587,6 @@ async function handleEvent(event) {
       console.error('Error processing image:', error);
       // Silent mode: don't reply on errors
     }
-  } else if (message.type === 'text') {
-    // Log text messages to capture group IDs
-    console.log('Text message received:', message.text);
-    await saveDetectionLog({
-      timestamp: new Date().toISOString(),
-      messageId: message.id,
-      groupId: sourceInfo.groupId,
-      userId: sourceInfo.userId,
-      status: 'info',
-      reason: `Text message: "${message.text.substring(0, 50)}${message.text.length > 50 ? '...' : ''}"`
-    });
   } else {
     console.log('Non-image message received:', message.type);
   }
@@ -1676,9 +1665,9 @@ app.get('/detection-logs', async (req, res) => {
           hour12: false
         });
 
-        const statusIcon = log.status === 'success' ? '✅' : log.status === 'failed' ? '❌' : log.status === 'info' ? 'ℹ️' : '⚠️';
-        const statusClass = log.status === 'success' ? 'status-success' : log.status === 'failed' ? 'status-failed' : log.status === 'info' ? 'status-info' : 'status-error';
-        const statusText = log.status === 'success' ? 'Success' : log.status === 'failed' ? 'Failed' : log.status === 'info' ? 'Info' : 'Error';
+        const statusIcon = log.status === 'success' ? '✅' : log.status === 'failed' ? '❌' : '⚠️';
+        const statusClass = log.status === 'success' ? 'status-success' : log.status === 'failed' ? 'status-failed' : 'status-error';
+        const statusText = log.status === 'success' ? 'Success' : log.status === 'failed' ? 'Failed' : 'Error';
 
         const groupIdHTML = log.groupId
           ? `<code style="background-color: #4CAF50; color: white; padding: 4px 8px; border-radius: 3px; font-weight: bold;">${log.groupId}</code>`
@@ -1786,10 +1775,6 @@ app.get('/detection-logs', async (req, res) => {
             color: #ff9800;
             font-weight: bold;
           }
-          .status-info {
-            color: #2196F3;
-            font-weight: bold;
-          }
           .details {
             font-size: 14px;
             line-height: 1.6;
@@ -1841,7 +1826,7 @@ app.get('/detection-logs', async (req, res) => {
             <a href="/detection-logs">Detection Logs</a>
           </div>
 
-          <h1>📋 Detection Logs</h1>
+          <h1>📋 Image Detection Logs</h1>
 
           <div class="summary">
             <div class="summary-card" style="background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);">
@@ -1855,10 +1840,6 @@ app.get('/detection-logs', async (req, res) => {
             <div class="summary-card" style="background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);">
               <div class="summary-number">${logs.filter(l => l.status === 'error').length}</div>
               <div class="summary-label">Errors</div>
-            </div>
-            <div class="summary-card" style="background: linear-gradient(135deg, #2196F3 0%, #1976D2 100%);">
-              <div class="summary-number">${logs.filter(l => l.status === 'info').length}</div>
-              <div class="summary-label">Info</div>
             </div>
             <div class="summary-card">
               <div class="summary-number">${logs.length}</div>

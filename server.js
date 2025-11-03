@@ -508,6 +508,12 @@ async function handleEvent(event) {
   console.log('[EVENT] Event type:', event.type);
 
   // Log source information (group ID, user ID, etc.)
+  const sourceInfo = {
+    type: event.source?.type,
+    groupId: event.source?.groupId || null,
+    userId: event.source?.userId || null
+  };
+
   if (event.source) {
     console.log('[EVENT] Source type:', event.source.type);
     if (event.source.groupId) {
@@ -540,7 +546,7 @@ async function handleEvent(event) {
 
       if (isExcelScreenshot) {
         console.log('[OCR] Excel screenshot detected, performing OCR...');
-        const { extractedText, recordResult } = await performOCR(imageBuffer, message.id);
+        const { extractedText, recordResult } = await performOCR(imageBuffer, message.id, sourceInfo);
         console.log('[OCR] Extraction completed, text length:', extractedText.length);
 
         // Only send reply if data was successfully recorded
@@ -568,6 +574,8 @@ async function handleEvent(event) {
         await saveDetectionLog({
           timestamp: new Date().toISOString(),
           messageId: message.id,
+          groupId: sourceInfo.groupId,
+          userId: sourceInfo.userId,
           status: 'failed',
           reason: 'Not an Excel screenshot (failed GPT-4 Vision detection)'
         });
@@ -638,7 +646,7 @@ async function detectExcelScreenshot(imageBuffer) {
   }
 }
 
-async function performOCR(imageBuffer, messageId = 'unknown') {
+async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null) {
   try {
     console.log('Starting Azure OCR...');
 
@@ -702,6 +710,8 @@ async function performOCR(imageBuffer, messageId = 'unknown') {
         await saveDetectionLog({
           timestamp: new Date().toISOString(),
           messageId: latestOCRResult.messageId || 'unknown',
+          groupId: sourceInfo?.groupId || null,
+          userId: sourceInfo?.userId || null,
           status: 'success',
           date: recordResult.date,
           categories: recordResult.results.map(r => r.category),
@@ -713,6 +723,8 @@ async function performOCR(imageBuffer, messageId = 'unknown') {
         await saveDetectionLog({
           timestamp: new Date().toISOString(),
           messageId: latestOCRResult.messageId || 'unknown',
+          groupId: sourceInfo?.groupId || null,
+          userId: sourceInfo?.userId || null,
           status: 'failed',
           reason: recordResult.reason
         });
@@ -723,6 +735,8 @@ async function performOCR(imageBuffer, messageId = 'unknown') {
       await saveDetectionLog({
         timestamp: new Date().toISOString(),
         messageId: latestOCRResult.messageId || 'unknown',
+        groupId: sourceInfo?.groupId || null,
+        userId: sourceInfo?.userId || null,
         status: 'error',
         reason: `Error: ${error.message}`
       });
@@ -1638,7 +1652,7 @@ app.get('/detection-logs', async (req, res) => {
 
     let logsHTML = '';
     if (logs.length === 0) {
-      logsHTML = '<tr><td colspan="4" class="no-data">No detection logs yet</td></tr>';
+      logsHTML = '<tr><td colspan="6" class="no-data">No detection logs yet</td></tr>';
     } else {
       logs.forEach(log => {
         const timestamp = new Date(log.timestamp).toLocaleString('en-US', {
@@ -1655,6 +1669,14 @@ app.get('/detection-logs', async (req, res) => {
         const statusClass = log.status === 'success' ? 'status-success' : log.status === 'failed' ? 'status-failed' : 'status-error';
         const statusText = log.status === 'success' ? 'Success' : log.status === 'failed' ? 'Failed' : 'Error';
 
+        const groupIdHTML = log.groupId
+          ? `<code style="background-color: #4CAF50; color: white; padding: 4px 8px; border-radius: 3px; font-weight: bold;">${log.groupId}</code>`
+          : '<span style="color: #999;">-</span>';
+
+        const userIdHTML = log.userId
+          ? `<code>${log.userId}</code>`
+          : '<span style="color: #999;">-</span>';
+
         let detailsHTML = '';
         if (log.status === 'success') {
           detailsHTML = `<strong>Date:</strong> ${log.date || 'N/A'}<br>
@@ -1668,6 +1690,8 @@ app.get('/detection-logs', async (req, res) => {
           <tr>
             <td>${timestamp}</td>
             <td><code>${log.messageId || 'unknown'}</code></td>
+            <td>${groupIdHTML}</td>
+            <td>${userIdHTML}</td>
             <td class="${statusClass}">${statusIcon} ${statusText}</td>
             <td class="details">${detailsHTML}</td>
           </tr>
@@ -1827,6 +1851,8 @@ app.get('/detection-logs', async (req, res) => {
             <tr>
               <th>Timestamp</th>
               <th>Message ID</th>
+              <th>Group ID</th>
+              <th>User ID</th>
               <th>Status</th>
               <th>Details</th>
             </tr>

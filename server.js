@@ -1273,6 +1273,7 @@ app.get('/daily-report', async (req, res) => {
             <a href="/transformed-data">Transformed Data</a>
             <a href="/daily-report">Daily Report</a>
             <a href="/detection-logs">Detection Logs</a>
+            <a href="/send-notification" style="background-color: #2196F3;">Send Notification</a>
           </div>
 
           <h1>📊 Daily Records Report</h1>
@@ -1844,6 +1845,7 @@ app.get('/detection-logs', async (req, res) => {
             <a href="/transformed-data">Transformed Data</a>
             <a href="/daily-report">Daily Report</a>
             <a href="/detection-logs">Detection Logs</a>
+            <a href="/send-notification" style="background-color: #2196F3;">Send Notification</a>
           </div>
 
           <h1>📋 Image Detection Logs</h1>
@@ -1886,6 +1888,256 @@ app.get('/detection-logs', async (req, res) => {
     console.error('Error loading detection logs:', error);
     res.status(500).send('Error loading detection logs');
   }
+});
+
+// API endpoint to send manual notification to LINE groups
+app.post('/api/send-notification', async (req, res) => {
+  try {
+    const { message } = req.body;
+
+    if (!message || message.trim() === '') {
+      return res.status(400).json({ success: false, error: 'Message is required' });
+    }
+
+    if (NOTIFICATION_GROUP_IDS.length === 0) {
+      return res.status(400).json({ success: false, error: 'No notification groups configured in .env' });
+    }
+
+    console.log('[MANUAL-NOTI] Sending manual notification to groups');
+    console.log('[MANUAL-NOTI] Message:', message);
+    console.log('[MANUAL-NOTI] Target groups:', NOTIFICATION_GROUP_IDS);
+
+    const results = [];
+    for (const groupId of NOTIFICATION_GROUP_IDS) {
+      try {
+        await client.pushMessage({
+          to: groupId,
+          messages: [{
+            type: 'text',
+            text: message,
+          }],
+        });
+        console.log(`[MANUAL-NOTI] Successfully sent to group: ${groupId}`);
+        results.push({ groupId, success: true });
+      } catch (error) {
+        console.error(`[MANUAL-NOTI] Failed to send to group ${groupId}:`, error.message);
+        results.push({ groupId, success: false, error: error.message });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    res.json({
+      success: true,
+      message: `Sent to ${successCount}/${NOTIFICATION_GROUP_IDS.length} groups`,
+      results
+    });
+  } catch (error) {
+    console.error('[MANUAL-NOTI] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Page for sending manual notifications
+app.get('/send-notification', (req, res) => {
+  const groupCount = NOTIFICATION_GROUP_IDS.length;
+  const groupIds = NOTIFICATION_GROUP_IDS.map(id => `<code>${id}</code>`).join('<br>');
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Send Notification</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          margin: 20px;
+          background-color: #f5f5f5;
+        }
+        .container {
+          max-width: 600px;
+          margin: 0 auto;
+          background-color: white;
+          padding: 30px;
+          border-radius: 10px;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+          text-align: center;
+          color: #333;
+          margin-bottom: 30px;
+        }
+        .nav {
+          margin-bottom: 20px;
+          text-align: center;
+        }
+        .nav a {
+          padding: 10px 20px;
+          background-color: #4CAF50;
+          color: white;
+          text-decoration: none;
+          margin: 0 5px;
+          border-radius: 5px;
+          display: inline-block;
+        }
+        .nav a:hover {
+          background-color: #45a049;
+        }
+        .info-box {
+          background-color: #e3f2fd;
+          border-left: 4px solid #2196F3;
+          padding: 15px;
+          margin-bottom: 20px;
+          border-radius: 4px;
+        }
+        .info-box strong {
+          color: #1976D2;
+        }
+        .form-group {
+          margin-bottom: 20px;
+        }
+        label {
+          display: block;
+          margin-bottom: 8px;
+          font-weight: bold;
+          color: #333;
+        }
+        textarea {
+          width: 100%;
+          padding: 12px;
+          border: 2px solid #ddd;
+          border-radius: 5px;
+          font-size: 16px;
+          resize: vertical;
+          min-height: 120px;
+          box-sizing: border-box;
+        }
+        textarea:focus {
+          border-color: #4CAF50;
+          outline: none;
+        }
+        button {
+          width: 100%;
+          padding: 15px;
+          background-color: #4CAF50;
+          color: white;
+          border: none;
+          border-radius: 5px;
+          font-size: 18px;
+          cursor: pointer;
+          transition: background-color 0.3s;
+        }
+        button:hover {
+          background-color: #45a049;
+        }
+        button:disabled {
+          background-color: #ccc;
+          cursor: not-allowed;
+        }
+        .result {
+          margin-top: 20px;
+          padding: 15px;
+          border-radius: 5px;
+          display: none;
+        }
+        .result.success {
+          background-color: #e8f5e9;
+          border-left: 4px solid #4CAF50;
+          color: #2e7d32;
+        }
+        .result.error {
+          background-color: #ffebee;
+          border-left: 4px solid #f44336;
+          color: #c62828;
+        }
+        code {
+          background-color: #f5f5f5;
+          padding: 2px 6px;
+          border-radius: 3px;
+          font-family: monospace;
+          font-size: 12px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="nav">
+          <a href="/daily-report">Daily Report</a>
+          <a href="/detection-logs">Detection Logs</a>
+          <a href="/send-notification">Send Notification</a>
+        </div>
+
+        <h1>📢 Send Notification to LINE Group</h1>
+
+        <div class="info-box">
+          <strong>Target Groups (${groupCount}):</strong><br>
+          ${groupCount > 0 ? groupIds : '<span style="color: #f44336;">No groups configured in .env</span>'}
+        </div>
+
+        <form id="notificationForm">
+          <div class="form-group">
+            <label for="message">Message:</label>
+            <textarea id="message" placeholder="Enter your notification message here..." required></textarea>
+          </div>
+          <button type="submit" id="sendBtn" ${groupCount === 0 ? 'disabled' : ''}>
+            📤 Send Notification
+          </button>
+        </form>
+
+        <div id="result" class="result"></div>
+      </div>
+
+      <script>
+        document.getElementById('notificationForm').addEventListener('submit', async function(e) {
+          e.preventDefault();
+
+          const message = document.getElementById('message').value.trim();
+          const sendBtn = document.getElementById('sendBtn');
+          const result = document.getElementById('result');
+
+          if (!message) {
+            result.className = 'result error';
+            result.textContent = 'Please enter a message';
+            result.style.display = 'block';
+            return;
+          }
+
+          sendBtn.disabled = true;
+          sendBtn.textContent = '⏳ Sending...';
+          result.style.display = 'none';
+
+          try {
+            const response = await fetch('/api/send-notification', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message })
+            });
+
+            const data = await response.json();
+
+            if (data.success) {
+              result.className = 'result success';
+              result.innerHTML = '✅ ' + data.message;
+            } else {
+              result.className = 'result error';
+              result.innerHTML = '❌ ' + data.error;
+            }
+          } catch (error) {
+            result.className = 'result error';
+            result.innerHTML = '❌ Error: ' + error.message;
+          }
+
+          result.style.display = 'block';
+          sendBtn.disabled = false;
+          sendBtn.textContent = '📤 Send Notification';
+        });
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 app.listen(PORT, () => {

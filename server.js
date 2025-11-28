@@ -131,12 +131,13 @@ async function recordDailyData(tableData, extractedText = '') {
 
   const table = tableData[0];
 
-  // Check if FC33 หาดใหญ่ C2 sum is not 0
+  // Check if FC33 หาดใหญ่ and FC07 Phuket C2 sums are not 0
   let hadyaiSum = 0;
+  let phuketSum = 0;
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 3) return;
 
-    // Check C0 for FC33 หาดใหญ่
+    // Check C0 for FC33 หาดใหญ่ and FC07 Phuket
     const c0Cell = row[0] ? row[0].toString().trim() : '';
 
     if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
@@ -145,13 +146,26 @@ async function recordDailyData(tableData, extractedText = '') {
       hadyaiSum += value;
       console.log(`[VALIDATION] Row ${rowIndex}: FC33 หาดใหญ่ found in C0, C2 value: ${value}`);
     }
+
+    if (c0Cell.includes('FC07') && c0Cell.toLowerCase().includes('phuket')) {
+      const c2Value = row[2] ? row[2].toString().replace(/,/g, '') : '0';
+      const value = parseFloat(c2Value) || 0;
+      phuketSum += value;
+      console.log(`[VALIDATION] Row ${rowIndex}: FC07 Phuket found in C0, C2 value: ${value}`);
+    }
   });
 
   console.log(`[VALIDATION] FC33 หาดใหญ่ total sum in C2: ${hadyaiSum}`);
+  console.log(`[VALIDATION] FC07 Phuket total sum in C2: ${phuketSum}`);
 
   if (hadyaiSum === 0) {
     console.log('[VALIDATION] FC33 หาดใหญ่ C2 sum is 0, not recording');
     return { success: false, reason: 'FC33 หาดใหญ่ C2 sum is 0 (validation failed)' };
+  }
+
+  if (phuketSum === 0) {
+    console.log('[VALIDATION] FC07 Phuket C2 sum is 0, not recording');
+    return { success: false, reason: 'FC07 Phuket C2 sum is 0 (validation failed)' };
   }
 
   // Extract date from table or extracted text

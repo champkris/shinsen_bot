@@ -147,11 +147,11 @@ async function recordDailyData(tableData, extractedText = '') {
       console.log(`[VALIDATION] Row ${rowIndex}: FC33 หาดใหญ่ found in C0, C2 value: ${value}`);
     }
 
-    if (c0Cell.includes('FC07') && (c0Cell.toLowerCase().includes('phuket') || c0Cell.includes('ภูเก็ต'))) {
+    if (c0Cell.includes('FC07')) {
       const c2Value = row[2] ? row[2].toString().replace(/,/g, '') : '0';
       const value = parseFloat(c2Value) || 0;
       phuketSum += value;
-      console.log(`[VALIDATION] Row ${rowIndex}: FC07 ภูเก็ต found in C0, C2 value: ${value}`);
+      console.log(`[VALIDATION] Row ${rowIndex}: FC07 found in C0, C2 value: ${value}`);
     }
   });
 

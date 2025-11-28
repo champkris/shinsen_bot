@@ -44,6 +44,7 @@ const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
   : [];
 
 console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
+console.log('[CONFIG] Notification group IDs:', NOTIFICATION_GROUP_IDS);
 
 // Load detection logs from file
 async function loadDetectionLogs() {
@@ -94,14 +95,19 @@ async function saveDailyRecords(records) {
 
 // Send notification to configured groups about data update
 async function sendNotificationToGroups(date, categories) {
+  console.log(`[NOTIFICATION] sendNotificationToGroups called with date: ${date}, categories:`, categories);
+  console.log(`[NOTIFICATION] NOTIFICATION_GROUP_IDS:`, NOTIFICATION_GROUP_IDS);
+
   if (NOTIFICATION_GROUP_IDS.length === 0) {
     console.log('[NOTIFICATION] No notification groups configured');
     return;
   }
 
   const message = `Report for ${date} has been recorded\n\nCategories: ${categories.join(', ')}\n\nView report: https://shinsen.yushi-marketing.com/daily-report`;
+  console.log(`[NOTIFICATION] Message to send: ${message}`);
 
   for (const groupId of NOTIFICATION_GROUP_IDS) {
+    console.log(`[NOTIFICATION] Attempting to send to group: ${groupId}`);
     try {
       await client.pushMessage({
         to: groupId,
@@ -110,11 +116,13 @@ async function sendNotificationToGroups(date, categories) {
           text: message,
         }],
       });
-      console.log(`[NOTIFICATION] Sent notification to group: ${groupId}`);
+      console.log(`[NOTIFICATION] Successfully sent notification to group: ${groupId}`);
     } catch (error) {
       console.error(`[NOTIFICATION] Failed to send to group ${groupId}:`, error.message);
+      console.error(`[NOTIFICATION] Full error:`, error);
     }
   }
+  console.log('[NOTIFICATION] sendNotificationToGroups completed');
 }
 
 // Check if date already exists in records

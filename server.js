@@ -1473,10 +1473,39 @@ function generateDailyRecordsTable(records, category) {
     html += '</tr>';
   });
 
-  // Add Month to Date Average row
+  // Add Month to Date Sum and Average rows
   if (recordCount > 0) {
-    html += '<tr style="background-color: #e0e0e0; font-weight: bold; border-top: 3px solid #333;">';
-    html += '<td style="background-color: #bdbdbd;">MTD Avg<br>(' + recordCount + ' days)</td>';
+    // MTD Sum row
+    html += '<tr style="background-color: #d1c4e9; font-weight: bold; border-top: 3px solid #333;">';
+    html += '<td style="background-color: #b39ddb;">MTD Sum<br>(' + recordCount + ' days)</td>';
+
+    // CDC column sums
+    cdcColumns.forEach(cdc => {
+      const sum = cdcSums[cdc];
+      const formattedSum = sum.toLocaleString('en-US');
+      if (cdc === 'คลังสุวรรณภูมิ') {
+        html += `<td style="background-color: #b39ddb;">${formattedSum}</td>`;
+      } else {
+        html += `<td>${formattedSum}</td>`;
+      }
+    });
+
+    // Orange category special columns sums
+    if (category.toLowerCase() === 'orange') {
+      html += `<td style="background-color: #ce93d8;">${laosSum.toLocaleString('en-US')}</td>`;
+      html += `<td style="background-color: #ce93d8;">${cambodiaSum.toLocaleString('en-US')}</td>`;
+    }
+
+    // Total sum
+    html += `<td style="background-color: #b39ddb;">${totalSumSum.toLocaleString('en-US')}</td>`;
+
+    // Empty cell for timestamp column
+    html += '<td style="background-color: #b39ddb;">-</td>';
+    html += '</tr>';
+
+    // MTD Average row
+    html += '<tr style="background-color: #e0e0e0; font-weight: bold;">';
+    html += '<td style="background-color: #bdbdbd;">MTD Avg</td>';
 
     // CDC column averages
     cdcColumns.forEach(cdc => {

@@ -1403,6 +1403,14 @@ function generateDailyRecordsTable(records, category) {
   html += '<th style="background-color: #4CAF50;">รวม</th>'; // Total sum column
   html += '<th style="background-color: #9c27b0;">Recorded At</th></tr>';
 
+  // Initialize sums for averaging
+  const cdcSums = {};
+  cdcColumns.forEach(cdc => cdcSums[cdc] = 0);
+  let totalSumSum = 0;
+  let laosSum = 0;
+  let cambodiaSum = 0;
+  const recordCount = sortedRecords.length;
+
   // Use the already sorted records (by date ascending)
   sortedRecords.forEach(record => {
     const recordedDate = new Date(record.timestamp).toLocaleString('th-TH', {
@@ -1422,6 +1430,7 @@ function generateDailyRecordsTable(records, category) {
     if (record.cdcTotals) {
       cdcColumns.forEach(cdc => {
         const value = record.cdcTotals[cdc] || 0;
+        cdcSums[cdc] += value; // Accumulate for average
         const formattedValue = value.toLocaleString('en-US');
 
         if (cdc === 'คลังสุวรรณภูมิ') {
@@ -1442,17 +1451,20 @@ function generateDailyRecordsTable(records, category) {
     if (category.toLowerCase() === 'orange') {
       // ขอนแก่น Laos column
       const laosValue = record.khonKaenLaos || 0;
+      laosSum += laosValue; // Accumulate for average
       const formattedLaos = laosValue.toLocaleString('en-US');
       html += `<td style="background-color: #FFE0B2; font-weight: bold;">${formattedLaos}</td>`;
 
       // ขอนแก่น Cambodia column (always blank/0)
       const cambodiaValue = record.khonKaenCambodia || 0;
+      cambodiaSum += cambodiaValue; // Accumulate for average
       const formattedCambodia = cambodiaValue.toLocaleString('en-US');
       html += `<td style="background-color: #FFE0B2;">${formattedCambodia}</td>`;
     }
 
     // Total sum column
     const totalValue = record.totalSum || 0;
+    totalSumSum += totalValue; // Accumulate for average
     const formattedTotal = totalValue.toLocaleString('en-US');
     html += `<td style="background-color: #c8e6c9; font-weight: bold;">${formattedTotal}</td>`;
 
@@ -1460,6 +1472,39 @@ function generateDailyRecordsTable(records, category) {
     html += `<td style="background-color: #f3e5f5; font-size: 0.9em;">${recordedDate}</td>`;
     html += '</tr>';
   });
+
+  // Add Month to Date Average row
+  if (recordCount > 0) {
+    html += '<tr style="background-color: #e0e0e0; font-weight: bold; border-top: 3px solid #333;">';
+    html += '<td style="background-color: #bdbdbd;">MTD Avg<br>(' + recordCount + ' days)</td>';
+
+    // CDC column averages
+    cdcColumns.forEach(cdc => {
+      const avg = Math.round(cdcSums[cdc] / recordCount);
+      const formattedAvg = avg.toLocaleString('en-US');
+      if (cdc === 'คลังสุวรรณภูมิ') {
+        html += `<td style="background-color: #bbdefb;">${formattedAvg}</td>`;
+      } else {
+        html += `<td>${formattedAvg}</td>`;
+      }
+    });
+
+    // Orange category special columns averages
+    if (category.toLowerCase() === 'orange') {
+      const laosAvg = Math.round(laosSum / recordCount);
+      const cambodiaAvg = Math.round(cambodiaSum / recordCount);
+      html += `<td style="background-color: #FFCC80;">${laosAvg.toLocaleString('en-US')}</td>`;
+      html += `<td style="background-color: #FFCC80;">${cambodiaAvg.toLocaleString('en-US')}</td>`;
+    }
+
+    // Total average
+    const totalAvg = Math.round(totalSumSum / recordCount);
+    html += `<td style="background-color: #a5d6a7;">${totalAvg.toLocaleString('en-US')}</td>`;
+
+    // Empty cell for timestamp column
+    html += '<td style="background-color: #bdbdbd;">-</td>';
+    html += '</tr>';
+  }
 
   html += '</table></div>';
   return html;

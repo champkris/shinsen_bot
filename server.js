@@ -140,51 +140,143 @@ async function isDateRecorded(date, category) {
   }
 }
 
-// Record daily data if R38C2 is not 0
-async function recordDailyData(tableData, extractedText = '') {
-  if (!tableData || tableData.length === 0) {
-    console.log('No table data to record');
-    return { success: false, reason: 'No table data found' };
+// Product detection configuration - keywords to identify each product in column headers
+const PRODUCT_DETECTION = {
+  orange: {
+    keywords: ['ส้ม', 'orange', 'น้ำส้ม'],
+    dbCategory: 'orange'
+  },
+  yuzu: {
+    keywords: ['ยูซุ', 'yuzu'],
+    dbCategory: 'yuzu'
+  },
+  pop: {
+    keywords: ['pop', 'shinsen pop', 'ป๊อป'],
+    dbCategory: 'pop'
+  },
+  mixed: {
+    keywords: ['ผลไม้รวม', 'mixed', 'รวม'],
+    dbCategory: 'mixed'
+  },
+  tomato: {
+    keywords: ['tomato', 'มะเขือเทศ'],
+    dbCategory: 'tomato'
+  }
+};
+
+// CDC names to track
+const CDC_NAMES = [
+  'บางบัวทอง',
+  'นครราชสีมา',
+  'นครสวรรค์',
+  'ชลบุรี',
+  'มหาชัย',
+  'สุวรรณภูมิ',
+  'หาดใหญ่',
+  'ภูเก็ต',
+  'เชียงใหม่',
+  'สุราษฎร์',
+  'ขอนแก่น'
+];
+
+// Map short names to full names for consistency
+const CDC_NAME_MAPPING = {
+  'บางบัวทอง': 'คลังบางบัวทอง',
+  'นครราชสีมา': 'นครราชสีมา',
+  'นครสวรรค์': 'นครสวรรค์',
+  'ชลบุรี': 'ชลบุรี',
+  'มหาชัย': 'คลังมหาชัย',
+  'สุวรรณภูมิ': 'คลังสุวรรณภูมิ',
+  'หาดใหญ่': 'หาดใหญ่',
+  'ภูเก็ต': 'ภูเก็ต',
+  'เชียงใหม่': 'เชียงใหม่',
+  'สุราษฎร์': 'สุราษฎร์',
+  'ขอนแก่น': 'ขอนแก่น'
+};
+
+// Detect product columns from table headers
+function detectProductColumns(table) {
+  const detectedProducts = {};
+
+  console.log('[DETECT] Scanning table for product columns...');
+
+  // Scan first 10 rows for header information
+  for (let rowIdx = 0; rowIdx < Math.min(10, table.length); rowIdx++) {
+    const row = table[rowIdx];
+    if (!row) continue;
+
+    // Check each column in this row
+    for (let colIdx = 0; colIdx < row.length; colIdx++) {
+      const cellText = row[colIdx] ? row[colIdx].toString().toLowerCase().trim() : '';
+      if (!cellText) continue;
+
+      // Check against each product's keywords
+      for (const [productKey, productConfig] of Object.entries(PRODUCT_DETECTION)) {
+        // Skip if already detected
+        if (detectedProducts[productKey]) continue;
+
+        // Check if any keyword matches
+        const matched = productConfig.keywords.some(keyword =>
+          cellText.includes(keyword.toLowerCase())
+        );
+
+        if (matched) {
+          detectedProducts[productKey] = {
+            column: colIdx,
+            dbCategory: productConfig.dbCategory,
+            foundIn: `Row ${rowIdx}, Col ${colIdx}: "${row[colIdx]}"`
+          };
+          console.log(`[DETECT] Found ${productKey} in column ${colIdx} (Row ${rowIdx}: "${row[colIdx]}")`);
+        }
+      }
+    }
   }
 
-  const table = tableData[0];
+  console.log(`[DETECT] Detected ${Object.keys(detectedProducts).length} products:`, Object.keys(detectedProducts));
+  return detectedProducts;
+}
 
-  // Check if FC33 หาดใหญ่ OR FC07 ภูเก็ต C2 sum is not 0
+// Validate table has data (check FC33 หาดใหญ่ or FC07 ภูเก็ต in any detected product column)
+function validateTableData(table, detectedProducts) {
+  // Get the first detected product's column for validation
+  const productColumns = Object.values(detectedProducts).map(p => p.column);
+  if (productColumns.length === 0) {
+    return { valid: false, reason: 'No product columns detected' };
+  }
+
   let hadyaiSum = 0;
   let phuketSum = 0;
+
+  // Check all detected product columns for validation
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 3) return;
 
-    // Check C0 for FC33 หาดใหญ่ and FC07 ภูเก็ต
     const c0Cell = row[0] ? row[0].toString().trim() : '';
 
-    if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
-      const c2Value = row[2] ? row[2].toString().replace(/,/g, '') : '0';
-      const value = parseFloat(c2Value) || 0;
-      hadyaiSum += value;
-      console.log(`[VALIDATION] Row ${rowIndex}: FC33 หาดใหญ่ found in C0, C2 value: ${value}`);
-    }
+    // Sum values from all product columns for validation
+    productColumns.forEach(colIdx => {
+      const value = row[colIdx] ? parseFloat(row[colIdx].toString().replace(/,/g, '')) || 0 : 0;
 
-    if (c0Cell.includes('FC07')) {
-      const c2Value = row[2] ? row[2].toString().replace(/,/g, '') : '0';
-      const value = parseFloat(c2Value) || 0;
-      phuketSum += value;
-      console.log(`[VALIDATION] Row ${rowIndex}: FC07 found in C0, C2 value: ${value}`);
-    }
+      if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
+        hadyaiSum += value;
+      }
+      if (c0Cell.includes('FC07')) {
+        phuketSum += value;
+      }
+    });
   });
 
-  console.log(`[VALIDATION] FC33 หาดใหญ่ total sum in C2: ${hadyaiSum}`);
-  console.log(`[VALIDATION] FC07 ภูเก็ต total sum in C2: ${phuketSum}`);
+  console.log(`[VALIDATION] FC33 หาดใหญ่ sum: ${hadyaiSum}, FC07 ภูเก็ต sum: ${phuketSum}`);
 
-  // Pass validation if EITHER FC33 หาดใหญ่ OR FC07 ภูเก็ต has non-zero sum
   if (hadyaiSum === 0 && phuketSum === 0) {
-    console.log('[VALIDATION] Both FC33 หาดใหญ่ and FC07 ภูเก็ต C2 sums are 0, not recording');
-    return { success: false, reason: 'Both FC33 หาดใหญ่ and FC07 ภูเก็ต C2 sums are 0 (validation failed)' };
+    return { valid: false, reason: 'Both FC33 หาดใหญ่ and FC07 ภูเก็ต sums are 0 (validation failed)', hadyaiSum, phuketSum };
   }
 
-  console.log(`[VALIDATION] Passed - FC33 หาดใหญ่: ${hadyaiSum}, FC07 ภูเก็ต: ${phuketSum}`);
+  return { valid: true, hadyaiSum, phuketSum };
+}
 
-  // Extract date from table or extracted text
+// Extract date from table or text
+function extractDate(table, extractedText) {
   let dateStr = null;
 
   // First, try to find date in the extracted text
@@ -194,240 +286,191 @@ async function recordDailyData(tableData, extractedText = '') {
     if (textDateMatch) {
       dateStr = textDateMatch[1];
       console.log(`[DATE] Found date in extracted text: ${dateStr}`);
+      return dateStr;
     }
   }
 
-  // If not found in text, search in table
-  if (!dateStr) {
-    console.log('[DATE] Date not in extracted text, searching table...');
-    for (let i = 0; i < Math.min(5, table.length); i++) {
-      const row = table[i];
-      console.log(`[DATE] Row ${i}:`, row ? row.slice(0, 5) : 'undefined');
-    }
+  // Search in table
+  console.log('[DATE] Searching for date in table...');
+  for (let i = 0; i < table.length; i++) {
+    const row = table[i];
+    if (!row) continue;
 
-    // Search entire table for date pattern (วันที่ DD/MM/YYYY)
+    for (let col = 0; col < row.length; col++) {
+      const cellText = row[col] ? row[col].toString() : '';
+      const dateMatch = cellText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (dateMatch) {
+        dateStr = dateMatch[1];
+        console.log(`[DATE] Found date: ${dateStr} in row ${i}, column ${col}`);
+        return dateStr;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Extract CDC totals for a specific product column
+function extractCDCTotals(table, columnIndex) {
+  const cdcTotals = {};
+  let totalSum = 0;
+
+  // Initialize all CDC totals to 0
+  Object.values(CDC_NAME_MAPPING).forEach(cdcFullName => {
+    cdcTotals[cdcFullName] = 0;
+  });
+
+  // Find the total sum from the table
+  for (let i = 0; i < table.length; i++) {
+    const row = table[i];
+    if (!row || row.length < 2) continue;
+
+    const c0 = row[0] ? row[0].toString().trim() : '';
+    const c1 = row[1] ? row[1].toString().trim() : '';
+
+    const totalIndicators = ['ยอดรวม', 'รวม', 'total', 'grand total', 'sum'];
+    const foundTotal = totalIndicators.some(indicator =>
+      c0.toLowerCase().includes(indicator.toLowerCase()) || c1.toLowerCase().includes(indicator.toLowerCase())
+    );
+
+    if (foundTotal && row[columnIndex]) {
+      const cellValue = row[columnIndex].toString().replace(/,/g, '');
+      totalSum = parseFloat(cellValue) || 0;
+      console.log(`[TOTAL] Found total sum: ${totalSum} in row ${i}`);
+      break;
+    }
+  }
+
+  // If no total row found, calculate by summing
+  if (totalSum === 0) {
     for (let i = 0; i < table.length; i++) {
       const row = table[i];
-      if (!row) continue;
-
-      // Check all columns in this row
-      for (let col = 0; col < row.length; col++) {
-        const cellText = row[col] ? row[col].toString() : '';
-
-        // Look for date patterns like "วันที่ 18/10/2025" or "18/10/2025"
-        const dateMatch = cellText.match(/(?:วันที่\s*)?(\d{1,2}\/\d{1,2}\/\d{4})/);
-        if (dateMatch) {
-          dateStr = dateMatch[1]; // Extract just the date part (DD/MM/YYYY)
-          console.log(`[DATE] Found date: ${dateStr} in row ${i}, column ${col}, cell: "${cellText}"`);
-          break;
-        }
-      }
-
-      if (dateStr) break;
+      if (!row || !row[columnIndex]) continue;
+      const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+      if (value > 0) totalSum += value;
     }
   }
 
+  // Extract CDC values
+  table.forEach((row, rowIndex) => {
+    if (!row || row.length < 2) return;
+
+    CDC_NAMES.forEach(cdcName => {
+      const fullCdcName = CDC_NAME_MAPPING[cdcName];
+      let searchCell;
+
+      if (fullCdcName === 'คลังบางบัวทอง') {
+        searchCell = row[0] ? row[0].toString().trim() : '';
+      } else if (fullCdcName.startsWith('คลัง')) {
+        searchCell = row[1] ? row[1].toString().trim() : '';
+      } else {
+        searchCell = row[0] ? row[0].toString().trim() : '';
+      }
+
+      if (searchCell.includes(cdcName) && row[columnIndex]) {
+        const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+        if (value > 0) {
+          cdcTotals[fullCdcName] += value;
+        }
+      }
+    });
+  });
+
+  return { cdcTotals, totalSum };
+}
+
+// Extract Khon Kaen Laos value for orange category
+function extractKhonKaenLaos(table, columnIndex) {
+  for (let i = table.length - 1; i >= 0; i--) {
+    const row = table[i];
+    if (!row || !row[0]) continue;
+
+    const c0 = row[0].toString().trim();
+    if (c0.includes('ขอนแก่น') && row[columnIndex]) {
+      const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+      console.log(`[LAOS] Found ขอนแก่น Laos value: ${value} in row ${i}`);
+      return value;
+    }
+  }
+  return 0;
+}
+
+// Record daily data - dynamically detects products from column headers
+async function recordDailyData(tableData, extractedText = '') {
+  if (!tableData || tableData.length === 0) {
+    console.log('No table data to record');
+    return { success: false, reason: 'No table data found' };
+  }
+
+  const table = tableData[0];
+
+  // Step 1: Detect product columns from headers
+  const detectedProducts = detectProductColumns(table);
+
+  if (Object.keys(detectedProducts).length === 0) {
+    console.log('[RECORD] No products detected in table headers');
+    return { success: false, reason: 'No product columns detected in table headers' };
+  }
+
+  // Step 2: Validate table has data
+  const validation = validateTableData(table, detectedProducts);
+  if (!validation.valid) {
+    console.log(`[VALIDATION] Failed: ${validation.reason}`);
+    return { success: false, reason: validation.reason };
+  }
+
+  console.log(`[VALIDATION] Passed - FC33 หาดใหญ่: ${validation.hadyaiSum}, FC07 ภูเก็ต: ${validation.phuketSum}`);
+
+  // Step 3: Extract date
+  const dateStr = extractDate(table, extractedText);
   if (!dateStr) {
-    console.log('[DATE] No date found in extracted text or table');
+    console.log('[DATE] No date found');
     return { success: false, reason: 'No date found in table or extracted text' };
   }
 
   console.log(`[DATE] Using date: ${dateStr}`);
 
-  // Calculate CDC totals for both orange and yuzu
-  const cdcConfig = {
-    orange: {
-      column: 2, // Column index for orange data (C2)
-    },
-    yuzu: {
-      column: 3, // Column index for yuzu data (C3)
-    }
-  };
-
-  // CDC names to track
-  const cdcNames = [
-    'บางบัวทอง',
-    'นครราชสีมา',
-    'นครสวรรค์',
-    'ชลบุรี',
-    'มหาชัย',
-    'สุวรรณภูมิ',
-    'หาดใหญ่',
-    'ภูเก็ต',
-    'เชียงใหม่',
-    'สุราษฎร์',
-    'ขอนแก่น'
-  ];
-
-  // Map short names to full names for consistency
-  const cdcNameMapping = {
-    'บางบัวทอง': 'คลังบางบัวทอง',
-    'นครราชสีมา': 'นครราชสีมา',
-    'นครสวรรค์': 'นครสวรรค์',
-    'ชลบุรี': 'ชลบุรี',
-    'มหาชัย': 'คลังมหาชัย',
-    'สุวรรณภูมิ': 'คลังสุวรรณภูมิ',
-    'หาดใหญ่': 'หาดใหญ่',
-    'ภูเก็ต': 'ภูเก็ต',
-    'เชียงใหม่': 'เชียงใหม่',
-    'สุราษฎร์': 'สุราษฎร์',
-    'ขอนแก่น': 'ขอนแก่น'
-  };
-
+  // Step 4: Extract data for each detected product
   const results = [];
 
-  // Loop through both categories (orange and yuzu)
-  for (const category of ['orange', 'yuzu']) {
-    // Check if this date is already recorded for this category (async MySQL query)
+  for (const [productKey, productInfo] of Object.entries(detectedProducts)) {
+    const category = productInfo.dbCategory;
+    const columnIndex = productInfo.column;
+
+    // Check if already recorded
     const alreadyRecorded = await isDateRecorded(dateStr, category);
     if (alreadyRecorded) {
       console.log(`Date ${dateStr} already recorded for ${category}`);
       continue;
     }
 
-    const columnIndex = cdcConfig[category].column;
-    const cdcTotals = {};
-    let totalSum = 0;
+    console.log(`[RECORD] Extracting ${category} from column ${columnIndex}`);
 
-    // Initialize all CDC totals to 0
-    Object.values(cdcNameMapping).forEach(cdcFullName => {
-      cdcTotals[cdcFullName] = 0;
-    });
+    // Extract CDC totals
+    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex);
 
-    console.log(`[RECORD] Calculating CDC totals for ${category} using column ${columnIndex}`);
+    // Extract Khon Kaen Laos for orange
+    const khonKaenLaosValue = category === 'orange' ? extractKhonKaenLaos(table, columnIndex) : 0;
 
-    // First, find the total sum from the table
-    // Look for a row containing "รวม" or "Total" in C0 or C1
-    console.log(`[TOTAL] Searching for total sum in ${table.length} rows for ${category}...`);
-
-    for (let i = 0; i < table.length; i++) {
-      const row = table[i];
-      if (!row || row.length < 2) continue;
-
-      const c0 = row[0] ? row[0].toString().trim() : '';
-      const c1 = row[1] ? row[1].toString().trim() : '';
-
-      // Log last few rows to debug
-      if (i >= table.length - 5) {
-        console.log(`[TOTAL] Row ${i}: C0="${c0}", C1="${c1}", C2="${row[2] || ''}", C3="${row[3] || ''}"`);
-      }
-
-      // Check if this row contains total indicator
-      // Check for various total indicators
-      const totalIndicators = ['ยอดรวม', 'รวม', 'total', 'grand total', 'sum'];
-      const foundTotal = totalIndicators.some(indicator =>
-        c0.toLowerCase().includes(indicator.toLowerCase()) || c1.toLowerCase().includes(indicator.toLowerCase())
-      );
-
-      if (foundTotal) {
-        // Extract the total sum from the appropriate column
-        if (row[columnIndex]) {
-          const cellValue = row[columnIndex].toString().replace(/,/g, '');
-          totalSum = parseFloat(cellValue) || 0;
-          console.log(`[TOTAL] Found total sum for ${category}: ${totalSum} in row ${i} (C0="${c0}", C1="${c1}")`);
-          break;
-        }
-      }
-    }
-
-    // If no total row found, calculate total by summing all values in the column
-    if (totalSum === 0) {
-      console.log(`[TOTAL] No ยอดรวม row found, calculating total by summing all values in column ${columnIndex}`);
-      for (let i = 0; i < table.length; i++) {
-        const row = table[i];
-        if (!row || !row[columnIndex]) continue;
-
-        const cellValue = row[columnIndex].toString().replace(/,/g, '').trim();
-        const value = parseFloat(cellValue) || 0;
-
-        if (value > 0) {
-          totalSum += value;
-        }
-      }
-      console.log(`[TOTAL] Calculated total sum for ${category}: ${totalSum}`);
-    }
-
-    // Iterate through table rows and sum values based on CDC name
-    table.forEach((row, rowIndex) => {
-      if (!row || row.length < 2) return;
-
-      // Find matching CDC name
-      cdcNames.forEach(cdcName => {
-        const fullCdcName = cdcNameMapping[cdcName];
-
-        // Determine which column to search based on CDC name
-        // Exception: "คลังบางบัวทอง" searches in C0 (looks for "FC01 บางบัวทอง" or similar)
-        // Other "คลัง" prefixed names search in C1
-        // All other locations search in C0
-        let searchColumnIndex;
-        let searchCell;
-
-        if (fullCdcName === 'คลังบางบัวทอง') {
-          // Exception: บางบัวทอง searches in C0 for "FC01 บางบัวทอง" or similar
-          searchColumnIndex = 0;
-          searchCell = row[0] ? row[0].toString().trim() : '';
-        } else if (fullCdcName.startsWith('คลัง')) {
-          // Search in C1 for other locations starting with "คลัง" (มหาชัย, สุวรรณภูมิ)
-          searchColumnIndex = 1;
-          searchCell = row[1] ? row[1].toString().trim() : '';
-        } else {
-          // Search in C0 for other locations
-          searchColumnIndex = 0;
-          searchCell = row[0] ? row[0].toString().trim() : '';
-        }
-
-        // Check if this row matches the CDC name
-        if (searchCell.includes(cdcName)) {
-          // Get value from the appropriate column (orange=C2, yuzu=C3)
-          if (row[columnIndex]) {
-            const cellValue = row[columnIndex].toString().replace(/,/g, '');
-            const value = parseFloat(cellValue) || 0;
-
-            if (value > 0) {
-              cdcTotals[fullCdcName] += value;
-              console.log(`[RECORD] Row ${rowIndex}: C${searchColumnIndex}="${searchCell}" -> ${fullCdcName} += ${value} (total: ${cdcTotals[fullCdcName]})`);
-            }
-          }
-        }
-      });
-    });
-
-    // For Orange category only: Extract ขอนแก่น Laos value from the last ขอนแก่น row
-    let khonKaenLaosValue = 0;
-    if (category === 'orange') {
-      // Find the last row containing ขอนแก่น in C0
-      for (let i = table.length - 1; i >= 0; i--) {
-        const row = table[i];
-        if (!row || !row[0]) continue;
-
-        const c0 = row[0].toString().trim();
-        if (c0.includes('ขอนแก่น')) {
-          // Extract value from C2 (column index 2)
-          if (row[2]) {
-            const cellValue = row[2].toString().replace(/,/g, '');
-            khonKaenLaosValue = parseFloat(cellValue) || 0;
-            console.log(`[LAOS] Found last ขอนแก่น row at index ${i}, C2 value: ${khonKaenLaosValue}`);
-            break;
-          }
-        }
-      }
-    }
-
-    // Extract all relevant data
+    // Build record
     const dailyRecord = {
       date: dateStr,
       timestamp: new Date().toISOString(),
-      fc33HadyaiSum: hadyaiSum, // Store FC33 หาดใหญ่ validation value
-      totalSum: totalSum, // Store total sum from source table
-      cdcTotals: cdcTotals, // Store CDC totals
-      khonKaenLaos: category === 'orange' ? khonKaenLaosValue : undefined, // ขอนแก่น Laos (Orange only)
-      khonKaenCambodia: category === 'orange' ? 0 : undefined // ขอนแก่น Cambodia (Orange only, always 0 for now)
+      fc33HadyaiSum: validation.hadyaiSum,
+      totalSum: totalSum,
+      cdcTotals: cdcTotals,
+      khonKaenLaos: category === 'orange' ? khonKaenLaosValue : undefined,
+      khonKaenCambodia: category === 'orange' ? 0 : undefined
     };
 
-    // Save record to MySQL
+    // Save to MySQL
     await saveDailyRecord(dailyRecord, category);
-    console.log(`Recorded daily data for ${dateStr} in ${category} category`);
+    console.log(`Recorded daily data for ${dateStr} in ${category} category (column ${columnIndex})`);
     results.push({ category, record: dailyRecord });
+  }
+
+  if (results.length === 0) {
+    return { success: false, reason: 'All detected products already recorded for this date' };
   }
 
   return { success: true, date: dateStr, results: results };

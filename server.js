@@ -151,11 +151,11 @@ const PRODUCT_DETECTION = {
     dbCategory: 'yuzu'
   },
   pop: {
-    keywords: ['pop', 'shinsen pop', 'ป๊อป'],
+    keywords: ['pop', 'shinsen pop', 'ป๊อป', 'มุกป๊อป'],
     dbCategory: 'pop'
   },
   mixed: {
-    keywords: ['ผลไม้รวม', 'mixed', 'รวม'],
+    keywords: ['ผลไม้รวม', 'น้ำผลไม้รวม', 'mixed fruit'],
     dbCategory: 'mixed'
   },
   tomato: {

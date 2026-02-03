@@ -1118,12 +1118,49 @@ app.get('/daily-report', async (req, res) => {
       totalRecords += categoryData[cat].records.length;
     }
 
+    // Prepare chart data - get all unique dates and build datasets
+    const allDates = new Set();
+    const activeCategories = Object.entries(categoryData).filter(([cat, data]) => data.records.length > 0);
+
+    activeCategories.forEach(([cat, data]) => {
+      data.records.forEach(record => allDates.add(record.date));
+    });
+
+    // Sort dates chronologically
+    const sortedDates = Array.from(allDates).sort((a, b) => {
+      const [dayA, monthA, yearA] = a.split('/').map(Number);
+      const [dayB, monthB, yearB] = b.split('/').map(Number);
+      return new Date(yearA, monthA - 1, dayA) - new Date(yearB, monthB - 1, dayB);
+    });
+
+    // Build chart datasets
+    const chartDatasets = activeCategories.map(([cat, data]) => {
+      const dateToTotal = {};
+      data.records.forEach(record => {
+        dateToTotal[record.date] = record.totalSum || 0;
+      });
+
+      return {
+        label: data.name,
+        data: sortedDates.map(date => dateToTotal[date] || 0),
+        backgroundColor: data.borderColor,
+        borderColor: data.borderColor,
+        borderWidth: 1
+      };
+    });
+
+    const chartLabels = sortedDates.map(date => {
+      const [day] = date.split('/');
+      return day;
+    });
+
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
         <title>Daily Records Report</title>
         <meta charset="utf-8">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
           body {
             font-family: Arial, sans-serif;
@@ -1311,7 +1348,7 @@ app.get('/daily-report', async (req, res) => {
           </div>
 
           <div class="summary">
-            ${Object.entries(categoryData).map(([cat, data]) => `
+            ${Object.entries(categoryData).filter(([cat, data]) => data.records.length > 0).map(([cat, data]) => `
               <div class="summary-card" style="background: linear-gradient(135deg, ${data.borderColor} 0%, ${data.borderColor}dd 100%);">
                 <div class="summary-number">${data.records.length}</div>
                 <div class="summary-label">${data.icon} ${data.name}</div>
@@ -1323,7 +1360,16 @@ app.get('/daily-report', async (req, res) => {
             </div>
           </div>
 
-          ${Object.entries(categoryData).map(([cat, data]) => `
+          ${totalRecords === 0 ? '<div class="no-data" style="padding: 40px; text-align: center; color: #666;">No records found for this month</div>' : ''}
+
+          ${totalRecords > 0 ? `
+          <div class="chart-container" style="background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            <h3 style="margin-top: 0; color: #333;">Daily Sales Chart</h3>
+            <canvas id="dailyChart" height="100"></canvas>
+          </div>
+          ` : ''}
+
+          ${Object.entries(categoryData).filter(([cat, data]) => data.records.length > 0).map(([cat, data]) => `
             <div class="category-section" style="background-color: ${data.bgColor}; border-left: 5px solid ${data.borderColor};">
               <div class="category-title" style="color: ${data.borderColor};">
                 ${data.icon} ${data.thaiName} Records
@@ -1339,6 +1385,47 @@ app.get('/daily-report', async (req, res) => {
             const year = document.getElementById('year-filter').value;
             window.location.href = '/daily-report?month=' + month + '&year=' + year;
           }
+
+          // Render stacked bar chart
+          ${totalRecords > 0 ? `
+          const ctx = document.getElementById('dailyChart').getContext('2d');
+          new Chart(ctx, {
+            type: 'bar',
+            data: {
+              labels: ${JSON.stringify(chartLabels)},
+              datasets: ${JSON.stringify(chartDatasets)}
+            },
+            options: {
+              responsive: true,
+              scales: {
+                x: {
+                  stacked: true,
+                  title: {
+                    display: true,
+                    text: 'Day of Month'
+                  }
+                },
+                y: {
+                  stacked: true,
+                  title: {
+                    display: true,
+                    text: 'Total Units'
+                  },
+                  beginAtZero: true
+                }
+              },
+              plugins: {
+                legend: {
+                  position: 'top'
+                },
+                tooltip: {
+                  mode: 'index',
+                  intersect: false
+                }
+              }
+            }
+          });
+          ` : ''}
         </script>
       </body>
       </html>

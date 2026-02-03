@@ -244,7 +244,7 @@ async function getDetectionLogs(limit = 100) {
     userId: row.user_id,
     status: row.status,
     date: row.date ? toDisplayDate(row.date) : null,
-    categories: row.categories ? JSON.parse(row.categories) : null,
+    categories: row.categories ? (typeof row.categories === 'string' ? JSON.parse(row.categories) : row.categories) : null,
     recordsCreated: row.records_created,
     reason: row.reason
   }));

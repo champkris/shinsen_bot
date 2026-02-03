@@ -5,6 +5,7 @@ const OpenAI = require('openai');
 const { DocumentAnalysisClient, AzureKeyCredential } = require('@azure/ai-form-recognizer');
 const fs = require('fs').promises;
 const path = require('path');
+const db = require('./db');
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -35,9 +36,6 @@ let latestOCRResult = {
   rawResult: null
 };
 
-const DAILY_RECORDS_FILE = path.join(__dirname, 'daily_records.json');
-const DETECTION_LOGS_FILE = path.join(__dirname, 'detection_logs.json');
-
 // Notification group IDs (comma-separated in .env)
 const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
   ? process.env.NOTIFICATION_GROUP_IDS.split(',').map(id => id.trim()).filter(id => id)
@@ -46,51 +44,58 @@ const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
 console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
 console.log('[CONFIG] Notification group IDs:', NOTIFICATION_GROUP_IDS);
 
-// Load detection logs from file
+// Test database connection on startup
+db.testConnection().then(connected => {
+  if (connected) {
+    console.log('[DB] MySQL database connected successfully');
+  } else {
+    console.error('[DB] WARNING: MySQL connection failed - check your database configuration');
+  }
+});
+
+// Load detection logs from MySQL
 async function loadDetectionLogs() {
   try {
-    const data = await fs.readFile(DETECTION_LOGS_FILE, 'utf8');
-    return JSON.parse(data);
+    return await db.getDetectionLogs(100);
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      return [];
-    }
-    throw error;
+    console.error('[LOG] Error loading detection logs:', error);
+    return [];
   }
 }
 
-// Save detection log
+// Save detection log to MySQL
 async function saveDetectionLog(logEntry) {
   try {
-    const logs = await loadDetectionLogs();
-    logs.unshift(logEntry); // Add to beginning for chronological order
-
-    // Keep only last 100 logs
-    const trimmedLogs = logs.slice(0, 100);
-
-    await fs.writeFile(DETECTION_LOGS_FILE, JSON.stringify(trimmedLogs, null, 2), 'utf8');
+    await db.saveDetectionLog(logEntry);
     console.log('[LOG] Detection log saved:', logEntry.status);
   } catch (error) {
     console.error('[LOG] Error saving detection log:', error);
   }
 }
 
-// Load daily records from file
+// Load daily records from MySQL
 async function loadDailyRecords() {
   try {
-    const data = await fs.readFile(DAILY_RECORDS_FILE, 'utf8');
-    return JSON.parse(data);
+    return await db.loadDailyRecords();
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      return { orange: [], yuzu: [] };
+    console.error('[RECORD] Error loading daily records:', error);
+    // Return empty arrays for all categories
+    const empty = {};
+    for (const cat of db.CATEGORIES) {
+      empty[cat] = [];
     }
-    throw error;
+    return empty;
   }
 }
 
-// Save daily records to file
-async function saveDailyRecords(records) {
-  await fs.writeFile(DAILY_RECORDS_FILE, JSON.stringify(records, null, 2), 'utf8');
+// Save a single daily record to MySQL
+async function saveDailyRecord(record, category) {
+  try {
+    await db.saveDailyRecord(record, category);
+  } catch (error) {
+    console.error('[RECORD] Error saving daily record:', error);
+    throw error;
+  }
 }
 
 // Send notification to configured groups about data update
@@ -125,9 +130,14 @@ async function sendNotificationToGroups(date, categories) {
   console.log('[NOTIFICATION] sendNotificationToGroups completed');
 }
 
-// Check if date already exists in records
-function isDateRecorded(records, date, category) {
-  return records[category].some(record => record.date === date);
+// Check if date already exists in records (uses MySQL)
+async function isDateRecorded(date, category) {
+  try {
+    return await db.isDateRecorded(date, category);
+  } catch (error) {
+    console.error('[RECORD] Error checking if date recorded:', error);
+    return false;
+  }
 }
 
 // Record daily data if R38C2 is not 0
@@ -224,8 +234,6 @@ async function recordDailyData(tableData, extractedText = '') {
 
   console.log(`[DATE] Using date: ${dateStr}`);
 
-  const records = await loadDailyRecords();
-
   // Calculate CDC totals for both orange and yuzu
   const cdcConfig = {
     orange: {
@@ -270,8 +278,9 @@ async function recordDailyData(tableData, extractedText = '') {
 
   // Loop through both categories (orange and yuzu)
   for (const category of ['orange', 'yuzu']) {
-    // Check if this date is already recorded for this category
-    if (isDateRecorded(records, dateStr, category)) {
+    // Check if this date is already recorded for this category (async MySQL query)
+    const alreadyRecorded = await isDateRecorded(dateStr, category);
+    if (alreadyRecorded) {
       console.log(`Date ${dateStr} already recorded for ${category}`);
       continue;
     }
@@ -415,13 +424,11 @@ async function recordDailyData(tableData, extractedText = '') {
       khonKaenCambodia: category === 'orange' ? 0 : undefined // ขอนแก่น Cambodia (Orange only, always 0 for now)
     };
 
-    records[category].push(dailyRecord);
+    // Save record to MySQL
+    await saveDailyRecord(dailyRecord, category);
     console.log(`Recorded daily data for ${dateStr} in ${category} category`);
     results.push({ category, record: dailyRecord });
   }
-
-  // Save all records at once
-  await saveDailyRecords(records);
 
   return { success: true, date: dateStr, results: results };
 }
@@ -1078,8 +1085,6 @@ app.get('/transformed-data', (req, res) => {
 
 app.get('/daily-report', async (req, res) => {
   try {
-    const records = await loadDailyRecords();
-
     // Get current date for default filter
     const now = new Date();
     const currentMonth = now.getMonth() + 1; // 1-12
@@ -1089,27 +1094,29 @@ app.get('/daily-report', async (req, res) => {
     const selectedMonth = parseInt(req.query.month) || currentMonth;
     const selectedYear = parseInt(req.query.year) || currentYear;
 
-    // Filter records by selected month and year
-    const filterByMonthYear = (recordsList) => {
-      if (!recordsList || recordsList.length === 0) return [];
+    // Fetch records directly filtered by month/year from MySQL
+    const records = await db.getDailyRecordsByMonth(selectedMonth, selectedYear);
 
-      return recordsList.filter(record => {
-        // Parse date in DD/MM/YYYY format
-        const dateParts = record.date.split('/');
-        if (dateParts.length !== 3) return false;
-
-        const recordMonth = parseInt(dateParts[1]);
-        const recordYear = parseInt(dateParts[2]);
-
-        return recordMonth === selectedMonth && recordYear === selectedYear;
-      });
+    // Generate table HTML for each category
+    const categoryData = {
+      orange: { records: records.orange || [], name: 'Orange', thaiName: 'น้ำส้ม', icon: '🍊', bgColor: '#fff3e0', borderColor: '#ff9800' },
+      yuzu: { records: records.yuzu || [], name: 'Yuzu', thaiName: 'ยูซุ', icon: '🍋', bgColor: '#fffde7', borderColor: '#fdd835' },
+      pop: { records: records.pop || [], name: 'Shinsen Pop', thaiName: 'Shinsen Pop', icon: '🍹', bgColor: '#e1f5fe', borderColor: '#03a9f4' },
+      mixed: { records: records.mixed || [], name: 'Mixed Fruit', thaiName: 'น้ำผลไม้รวม', icon: '🍇', bgColor: '#f3e5f5', borderColor: '#9c27b0' },
+      tomato: { records: records.tomato || [], name: 'Tomato Yuzu', thaiName: 'Tomato Yuzu', icon: '🍅', bgColor: '#ffebee', borderColor: '#f44336' }
     };
 
-    const filteredOrange = filterByMonthYear(records.orange);
-    const filteredYuzu = filterByMonthYear(records.yuzu);
+    // Generate tables for each category
+    const categoryTables = {};
+    for (const [cat, data] of Object.entries(categoryData)) {
+      categoryTables[cat] = generateDailyRecordsTable(data.records, data.name);
+    }
 
-    const orangeTableHTML = generateDailyRecordsTable(filteredOrange, 'Orange');
-    const yuzuTableHTML = generateDailyRecordsTable(filteredYuzu, 'Yuzu');
+    // Calculate totals
+    let totalRecords = 0;
+    for (const cat of Object.keys(categoryData)) {
+      totalRecords += categoryData[cat].records.length;
+    }
 
     res.send(`
       <!DOCTYPE html>
@@ -1304,33 +1311,26 @@ app.get('/daily-report', async (req, res) => {
           </div>
 
           <div class="summary">
+            ${Object.entries(categoryData).map(([cat, data]) => `
+              <div class="summary-card" style="background: linear-gradient(135deg, ${data.borderColor} 0%, ${data.borderColor}dd 100%);">
+                <div class="summary-number">${data.records.length}</div>
+                <div class="summary-label">${data.icon} ${data.name}</div>
+              </div>
+            `).join('')}
             <div class="summary-card">
-              <div class="summary-number">${filteredOrange.length}</div>
-              <div class="summary-label">Orange Records</div>
-            </div>
-            <div class="summary-card">
-              <div class="summary-number">${filteredYuzu.length}</div>
-              <div class="summary-label">Yuzu Records</div>
-            </div>
-            <div class="summary-card">
-              <div class="summary-number">${filteredOrange.length + filteredYuzu.length}</div>
+              <div class="summary-number">${totalRecords}</div>
               <div class="summary-label">Total Records</div>
             </div>
           </div>
 
-          <div class="category-section orange-section">
-            <div class="category-title orange-title">
-              🍊 Orange Records
+          ${Object.entries(categoryData).map(([cat, data]) => `
+            <div class="category-section" style="background-color: ${data.bgColor}; border-left: 5px solid ${data.borderColor};">
+              <div class="category-title" style="color: ${data.borderColor};">
+                ${data.icon} ${data.thaiName} Records
+              </div>
+              ${categoryTables[cat]}
             </div>
-            ${orangeTableHTML}
-          </div>
-
-          <div class="category-section yuzu-section">
-            <div class="category-title yuzu-title">
-              🍋 Yuzu Records
-            </div>
-            ${yuzuTableHTML}
-          </div>
+          `).join('')}
         </div>
 
         <script>

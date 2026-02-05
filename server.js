@@ -164,6 +164,28 @@ const PRODUCT_DETECTION = {
   }
 };
 
+// Helper function to parse numbers from OCR
+// Handles: commas, periods as thousand separators (OCR misreads), newlines/whitespace
+function parseOCRNumber(str) {
+  if (!str) return 0;
+  let s = str.toString().trim();
+
+  // Remove whitespace and newlines
+  s = s.replace(/[\s]/g, '');
+
+  // Check if period is used as thousand separator (e.g., "1.331" should be 1331)
+  // Pattern: digit(s), period, exactly 3 digits, end of string
+  if (/^\d+\.\d{3}$/.test(s)) {
+    // Period is thousand separator, remove it
+    s = s.replace(/\./g, '');
+  }
+
+  // Remove commas (thousand separators)
+  s = s.replace(/,/g, '');
+
+  return parseFloat(s) || 0;
+}
+
 // CDC names to track
 const CDC_NAMES = [
   'บางบัวทอง',
@@ -255,7 +277,7 @@ function validateTableData(table, detectedProducts) {
 
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
-      const value = row[colIdx] ? parseFloat(row[colIdx].toString().replace(/[\s,]/g, '')) || 0 : 0;
+      const value = row[colIdx] ? parseOCRNumber(row[colIdx]) : 0;
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
         hadyaiSum += value;
@@ -314,6 +336,7 @@ function extractDate(table, extractedText) {
 function extractCDCTotals(table, columnIndex) {
   const cdcTotals = {};
   let totalSum = 0;
+  let totalsRowIndex = -1;
 
   // Initialize all CDC totals to 0
   Object.values(CDC_NAME_MAPPING).forEach(cdcFullName => {
@@ -334,26 +357,62 @@ function extractCDCTotals(table, columnIndex) {
     );
 
     if (foundTotal && row[columnIndex]) {
-      const cellValue = row[columnIndex].toString().replace(/[\s,]/g, '');
-      totalSum = parseFloat(cellValue) || 0;
+      totalSum = parseOCRNumber(row[columnIndex]);
+      totalsRowIndex = i;
       console.log(`[TOTAL] Found total sum: ${totalSum} in row ${i}`);
       break;
     }
   }
 
-  // If no total row found, calculate by summing
+  // If no total row found by indicators, check the last row with multiple large values
+  // The totals row typically has values in multiple product columns (orange, yuzu, pop, etc.)
+  if (totalSum === 0) {
+    // Check last few rows for potential totals row
+    for (let i = table.length - 1; i >= Math.max(0, table.length - 5); i--) {
+      const row = table[i];
+      if (!row) continue;
+
+      // Count how many columns have values > 100 (typical for totals)
+      let largeValueCount = 0;
+      for (let col = 2; col <= 4; col++) {
+        if (row[col]) {
+          const val = parseOCRNumber(row[col]);
+          if (val > 100) largeValueCount++;
+        }
+      }
+
+      // If 2+ columns have large values, this is likely the totals row
+      if (largeValueCount >= 2) {
+        totalSum = parseOCRNumber(row[columnIndex]);
+        totalsRowIndex = i;
+        console.log(`[TOTAL] Detected totals row by pattern at row ${i}, total: ${totalSum}`);
+        break;
+      }
+    }
+  }
+
+  // Fallback: calculate by summing (excluding detected totals row)
   if (totalSum === 0) {
     for (let i = 0; i < table.length; i++) {
+      if (i === totalsRowIndex) continue;
       const row = table[i];
       if (!row || !row[columnIndex]) continue;
-      const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
+      const value = parseOCRNumber(row[columnIndex]);
       if (value > 0) totalSum += value;
     }
   }
 
-  // Extract CDC values
+  console.log(`[CDC] Extracting CDC values, excluding totals row index: ${totalsRowIndex}`);
+
+  // Extract CDC values (excluding the totals row)
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
+
+    // Skip the totals row
+    if (rowIndex === totalsRowIndex) {
+      console.log(`[CDC] Skipping totals row ${rowIndex}`);
+      return;
+    }
 
     CDC_NAMES.forEach(cdcName => {
       const fullCdcName = CDC_NAME_MAPPING[cdcName];
@@ -368,8 +427,7 @@ function extractCDCTotals(table, columnIndex) {
       }
 
       if (searchCell.includes(cdcName) && row[columnIndex]) {
-        // Remove commas, newlines, and whitespace from numbers (Azure OCR may split "1,290" as "1\n290")
-        const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
+        const value = parseOCRNumber(row[columnIndex]);
         if (value > 0) {
           cdcTotals[fullCdcName] += value;
         }
@@ -388,7 +446,7 @@ function extractKhonKaenLaos(table, columnIndex) {
 
     const c0 = row[0].toString().trim();
     if (c0.includes('ขอนแก่น') && row[columnIndex]) {
-      const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
+      const value = parseOCRNumber(row[columnIndex]);
       console.log(`[LAOS] Found ขอนแก่น Laos value: ${value} in row ${i}`);
       return value;
     }
@@ -908,8 +966,7 @@ function transformTableData(tableData, columnIndex = 2) {
       if (searchCell.includes(cdcName)) {
         // Get value from the specified column (C2 for orange, C3 for yuzu)
         if (row[columnIndex]) {
-          const cellValue = row[columnIndex].toString().replace(/[\s,]/g, '');
-          const value = parseFloat(cellValue) || 0;
+          const value = parseOCRNumber(row[columnIndex]);
 
           if (value > 0) {
             cdcTotals[fullCdcName] += value;

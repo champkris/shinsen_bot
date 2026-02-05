@@ -255,7 +255,7 @@ function validateTableData(table, detectedProducts) {
 
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
-      const value = row[colIdx] ? parseFloat(row[colIdx].toString().replace(/,/g, '')) || 0 : 0;
+      const value = row[colIdx] ? parseFloat(row[colIdx].toString().replace(/[\s,]/g, '')) || 0 : 0;
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
         hadyaiSum += value;
@@ -334,7 +334,7 @@ function extractCDCTotals(table, columnIndex) {
     );
 
     if (foundTotal && row[columnIndex]) {
-      const cellValue = row[columnIndex].toString().replace(/,/g, '');
+      const cellValue = row[columnIndex].toString().replace(/[\s,]/g, '');
       totalSum = parseFloat(cellValue) || 0;
       console.log(`[TOTAL] Found total sum: ${totalSum} in row ${i}`);
       break;
@@ -346,7 +346,7 @@ function extractCDCTotals(table, columnIndex) {
     for (let i = 0; i < table.length; i++) {
       const row = table[i];
       if (!row || !row[columnIndex]) continue;
-      const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+      const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
       if (value > 0) totalSum += value;
     }
   }
@@ -368,7 +368,8 @@ function extractCDCTotals(table, columnIndex) {
       }
 
       if (searchCell.includes(cdcName) && row[columnIndex]) {
-        const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+        // Remove commas, newlines, and whitespace from numbers (Azure OCR may split "1,290" as "1\n290")
+        const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
         if (value > 0) {
           cdcTotals[fullCdcName] += value;
         }
@@ -387,7 +388,7 @@ function extractKhonKaenLaos(table, columnIndex) {
 
     const c0 = row[0].toString().trim();
     if (c0.includes('ขอนแก่น') && row[columnIndex]) {
-      const value = parseFloat(row[columnIndex].toString().replace(/,/g, '')) || 0;
+      const value = parseFloat(row[columnIndex].toString().replace(/[\s,]/g, '')) || 0;
       console.log(`[LAOS] Found ขอนแก่น Laos value: ${value} in row ${i}`);
       return value;
     }
@@ -907,7 +908,7 @@ function transformTableData(tableData, columnIndex = 2) {
       if (searchCell.includes(cdcName)) {
         // Get value from the specified column (C2 for orange, C3 for yuzu)
         if (row[columnIndex]) {
-          const cellValue = row[columnIndex].toString().replace(/,/g, '');
+          const cellValue = row[columnIndex].toString().replace(/[\s,]/g, '');
           const value = parseFloat(cellValue) || 0;
 
           if (value > 0) {

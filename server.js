@@ -333,7 +333,7 @@ function extractDate(table, extractedText) {
 }
 
 // Extract CDC totals for a specific product column
-function extractCDCTotals(table, columnIndex) {
+function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   const cdcTotals = {};
   let totalSum = 0;
   let totalsRowIndex = -1;
@@ -365,14 +365,11 @@ function extractCDCTotals(table, columnIndex) {
   }
 
   // If no total row found by indicators, check the last row with multiple large values
-  // The totals row typically has values in multiple product columns (orange, yuzu, pop, etc.)
   if (totalSum === 0) {
-    // Check last few rows for potential totals row
     for (let i = table.length - 1; i >= Math.max(0, table.length - 5); i--) {
       const row = table[i];
       if (!row) continue;
 
-      // Count how many columns have values > 100 (typical for totals)
       let largeValueCount = 0;
       for (let col = 2; col <= 4; col++) {
         if (row[col]) {
@@ -381,7 +378,6 @@ function extractCDCTotals(table, columnIndex) {
         }
       }
 
-      // If 2+ columns have large values, this is likely the totals row
       if (largeValueCount >= 2) {
         totalSum = parseOCRNumber(row[columnIndex]);
         totalsRowIndex = i;
@@ -404,15 +400,13 @@ function extractCDCTotals(table, columnIndex) {
 
   console.log(`[CDC] Extracting CDC values, excluding totals row index: ${totalsRowIndex}`);
 
-  // Extract CDC values (excluding the totals row)
+  // Extract CDC values row by row, tracking individual contributions for ratio correction
+  const CRATE_TOTAL_COL = 6; // C6 = ตะกร้า รวม (total crates)
+  const cdcRows = [];
+
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
-
-    // Skip the totals row
-    if (rowIndex === totalsRowIndex) {
-      console.log(`[CDC] Skipping totals row ${rowIndex}`);
-      return;
-    }
+    if (rowIndex === totalsRowIndex) return;
 
     CDC_NAMES.forEach(cdcName => {
       const fullCdcName = CDC_NAME_MAPPING[cdcName];
@@ -428,12 +422,53 @@ function extractCDCTotals(table, columnIndex) {
 
       if (searchCell.includes(cdcName) && row[columnIndex]) {
         const value = parseOCRNumber(row[columnIndex]);
+        const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
         if (value > 0) {
-          cdcTotals[fullCdcName] += value;
+          cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
         }
       }
     });
   });
+
+  // Ratio correction: fix truncated values where bottle/crate ratio is suspiciously low
+  // Normal range: ~25-42 bottles per crate. Below 20 indicates a missing digit.
+  // Only correct when crates >= 2 to avoid false positives on genuinely small orders
+  const rawSum = cdcRows.reduce((s, r) => s + r.value, 0);
+  const targetTotal = yodruamTotal > 0 ? yodruamTotal : totalSum;
+
+  if (rawSum !== targetTotal && targetTotal > 0) {
+    for (const entry of cdcRows) {
+      if (entry.crateTotal < 2) continue;
+      const ratio = entry.value / entry.crateTotal;
+      if (ratio >= 20 || entry.value <= 1) continue;
+
+      // Value appears truncated - try appending digit 0-9
+      let bestCandidate = null;
+      for (let d = 0; d <= 9; d++) {
+        const candidate = entry.value * 10 + d;
+        const candRatio = candidate / entry.crateTotal;
+        if (candRatio >= 25 && candRatio <= 42) {
+          bestCandidate = { val: candidate, ratio: candRatio, digit: d };
+          break;
+        }
+      }
+
+      if (bestCandidate) {
+        console.log(`[RATIO-FIX] Row ${entry.rowIndex} (${entry.cdcName}): ${entry.value} → ${bestCandidate.val} (ratio ${ratio.toFixed(1)} → ${bestCandidate.ratio.toFixed(1)}, crates=${entry.crateTotal})`);
+        entry.value = bestCandidate.val;
+      }
+    }
+
+    const correctedSum = cdcRows.reduce((s, r) => s + r.value, 0);
+    if (correctedSum !== rawSum) {
+      console.log(`[RATIO-FIX] Corrected: ${rawSum} → ${correctedSum} (ยอดรวม=${targetTotal}, remaining diff=${targetTotal - correctedSum})`);
+    }
+  }
+
+  // Build CDC totals from (possibly corrected) row values
+  for (const entry of cdcRows) {
+    cdcTotals[entry.cdcName] += entry.value;
+  }
 
   return { cdcTotals, totalSum };
 }
@@ -454,8 +489,53 @@ function extractKhonKaenLaos(table, columnIndex) {
   return 0;
 }
 
+// Extract ยอดรวม (totals) from raw OCR page text, mapped to table column indices
+// The ยอดรวม row is often outside the table structure but always present in raw text
+function extractYodruamTotals(rawResult) {
+  if (!rawResult || !rawResult.pages) return {};
+
+  for (const page of rawResult.pages) {
+    if (!page.lines) continue;
+
+    // Find the ยอดรวม line
+    let yodruamY = null;
+    for (const line of page.lines) {
+      if (line.content.includes('ยอดรวม') && line.polygon) {
+        yodruamY = line.polygon[0].y;
+        break;
+      }
+    }
+
+    if (yodruamY === null) continue;
+
+    // Find all numeric values on the same y-level
+    const nearLines = page.lines.filter(l =>
+      l.polygon && Math.abs(l.polygon[0].y - yodruamY) < 15 &&
+      /[\d,.]/.test(l.content) && !l.content.includes('ยอดรวม')
+    );
+
+    // Sort by x-position (left to right)
+    nearLines.sort((a, b) => a.polygon[0].x - b.polygon[0].x);
+
+    // The ยอดรวม numbers correspond to columns in order starting from C2
+    // C0=Vendor, C1=Warehouse are text columns; C2+ are numeric data columns
+    const FIRST_NUMERIC_COLUMN = 2;
+    const yodruamByColumn = {};
+    nearLines.forEach((line, idx) => {
+      const col = FIRST_NUMERIC_COLUMN + idx;
+      const value = parseOCRNumber(line.content);
+      yodruamByColumn[col] = value;
+      console.log(`[ยอดรวม] Column ${col}: ${value} (raw="${line.content}", x=${line.polygon[0].x.toFixed(0)})`);
+    });
+
+    return yodruamByColumn;
+  }
+
+  return {};
+}
+
 // Record daily data - dynamically detects products from column headers
-async function recordDailyData(tableData, extractedText = '') {
+async function recordDailyData(tableData, extractedText = '', rawResult = null) {
   if (!tableData || tableData.length === 0) {
     console.log('No table data to record');
     return { success: false, reason: 'No table data found' };
@@ -489,7 +569,16 @@ async function recordDailyData(tableData, extractedText = '') {
 
   console.log(`[DATE] Using date: ${dateStr}`);
 
-  // Step 4: Extract data for each detected product
+  // Step 4: Extract ยอดรวม (totals) from raw OCR page text
+  // The ยอดรวม row is often outside the table structure but reliably OCR'd from raw text
+  const yodruamTotals = rawResult ? extractYodruamTotals(rawResult) : {};
+  if (Object.keys(yodruamTotals).length > 0) {
+    console.log(`[ยอดรวม] Extracted totals from raw page text:`, yodruamTotals);
+  } else {
+    console.log(`[ยอดรวม] No totals found in raw page text`);
+  }
+
+  // Step 5: Extract data for each detected product
   const results = [];
 
   for (const [productKey, productInfo] of Object.entries(detectedProducts)) {
@@ -505,8 +594,20 @@ async function recordDailyData(tableData, extractedText = '') {
 
     console.log(`[RECORD] Extracting ${category} from column ${columnIndex}`);
 
-    // Extract CDC totals
-    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex);
+    // Extract CDC totals, passing ยอดรวม for ratio-based correction of truncated values
+    const yodruamValue = yodruamTotals[columnIndex] || 0;
+    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex, yodruamValue);
+
+    // Use ยอดรวม from raw text as authoritative total when available
+    let finalTotalSum = totalSum;
+    if (yodruamValue && yodruamValue > 0) {
+      if (yodruamValue !== totalSum) {
+        console.log(`[ยอดรวม] ${category}: Cell sum=${totalSum} differs from ยอดรวม=${yodruamValue} (diff=${yodruamValue - totalSum}). Using ยอดรวม as authoritative total.`);
+      } else {
+        console.log(`[ยอดรวม] ${category}: Cell sum matches ยอดรวม=${yodruamValue} ✓`);
+      }
+      finalTotalSum = yodruamValue;
+    }
 
     // Extract Khon Kaen Laos for orange
     const khonKaenLaosValue = category === 'orange' ? extractKhonKaenLaos(table, columnIndex) : 0;
@@ -516,7 +617,7 @@ async function recordDailyData(tableData, extractedText = '') {
       date: dateStr,
       timestamp: new Date().toISOString(),
       fc33HadyaiSum: validation.hadyaiSum,
-      totalSum: totalSum,
+      totalSum: finalTotalSum,
       cdcTotals: cdcTotals,
       khonKaenLaos: category === 'orange' ? khonKaenLaosValue : undefined,
       khonKaenCambodia: category === 'orange' ? 0 : undefined
@@ -832,7 +933,7 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
     // Record daily data if conditions are met
     let recordResult = null;
     try {
-      recordResult = await recordDailyData(tableData, extractedText);
+      recordResult = await recordDailyData(tableData, extractedText, result);
       if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
         // Log successful extraction

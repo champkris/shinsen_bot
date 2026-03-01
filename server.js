@@ -41,8 +41,12 @@ const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
   ? process.env.NOTIFICATION_GROUP_IDS.split(',').map(id => id.trim()).filter(id => id)
   : [];
 
+// Auto-send notification after successful extraction (default: true)
+const AUTO_NOTIFY = process.env.AUTO_NOTIFY !== 'false';
+
 console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
 console.log('[CONFIG] Notification group IDs:', NOTIFICATION_GROUP_IDS);
+console.log('[CONFIG] Auto-notify:', AUTO_NOTIFY);
 
 // Test database connection on startup
 db.testConnection().then(connected => {
@@ -793,9 +797,13 @@ async function handleEvent(event) {
 
           console.log('Success message sent to user');
 
-          // Send notifications to configured groups
-          const categories = recordResult.results.map(r => r.category);
-          await sendNotificationToGroups(recordResult.date, categories);
+          // Send notifications to configured groups (if AUTO_NOTIFY is enabled)
+          if (AUTO_NOTIFY) {
+            const categories = recordResult.results.map(r => r.category);
+            await sendNotificationToGroups(recordResult.date, categories);
+          } else {
+            console.log('[NOTIFICATION] Auto-notify disabled, skipping group notification');
+          }
         } else {
           console.log('Data not recorded, no reply sent');
         }

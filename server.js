@@ -4,8 +4,16 @@ const line = require('@line/bot-sdk');
 const OpenAI = require('openai');
 const { DocumentAnalysisClient, AzureKeyCredential } = require('@azure/ai-form-recognizer');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const db = require('./db');
+
+// Debug logging to file
+const logFile = fsSync.createWriteStream(path.join(__dirname, 'debug.log'), { flags: 'a' });
+const origLog = console.log;
+const origError = console.error;
+console.log = (...args) => { logFile.write(new Date().toISOString() + ' ' + args.join(' ') + '\n'); origLog(...args); };
+console.error = (...args) => { logFile.write(new Date().toISOString() + ' ERROR ' + args.join(' ') + '\n'); origError(...args); };
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,

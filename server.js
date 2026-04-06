@@ -50,7 +50,7 @@ const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
   : [];
 
 // Auto-send notification after successful extraction (default: true)
-const AUTO_NOTIFY = process.env.AUTO_NOTIFY !== 'false';
+const AUTO_NOTIFY = process.env.AUTO_NOTIFY?.toLowerCase() !== 'false';
 
 console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
 console.log('[CONFIG] Notification group IDs:', NOTIFICATION_GROUP_IDS);

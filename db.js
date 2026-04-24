@@ -250,6 +250,83 @@ async function getDetectionLogs(limit = 100) {
   }));
 }
 
+// Sum total_sum by category within an inclusive date range.
+// Returns an object like { orange: 12345, yuzu: 6789 } — categories with zero are omitted.
+async function getAggregateByCategory(startDate, endDate) {
+  const [rows] = await pool.execute(
+    `SELECT category, SUM(total_sum) AS volume
+     FROM daily_records
+     WHERE date BETWEEN ? AND ?
+     GROUP BY category`,
+    [startDate, endDate]
+  );
+  const result = {};
+  for (const row of rows) {
+    result[row.category] = Number(row.volume) || 0;
+  }
+  return result;
+}
+
+// Latest day-of-month with any data in the given month, or null if none.
+async function getLatestDayWithData(year, month) {
+  const [rows] = await pool.execute(
+    `SELECT MAX(DAY(date)) AS day FROM daily_records
+     WHERE YEAR(date) = ? AND MONTH(date) = ?`,
+    [year, month]
+  );
+  return rows[0]?.day ? Number(rows[0].day) : null;
+}
+
+// Distinct categories ever recorded or ever given a target.
+async function getKnownCategories() {
+  const [rows] = await pool.execute(
+    `SELECT category FROM daily_records
+     UNION
+     SELECT category FROM monthly_targets`
+  );
+  return rows.map(r => r.category);
+}
+
+// Targets for a single month as { category: target_value }.
+async function getTargets(year, month) {
+  const [rows] = await pool.execute(
+    `SELECT category, target_value FROM monthly_targets
+     WHERE year = ? AND month = ?`,
+    [year, month]
+  );
+  const result = {};
+  for (const row of rows) {
+    result[row.category] = Number(row.target_value) || 0;
+  }
+  return result;
+}
+
+// Sum of monthly targets from January through the given month (inclusive), per category.
+async function getTargetsYTD(year, throughMonth) {
+  const [rows] = await pool.execute(
+    `SELECT category, SUM(target_value) AS total
+     FROM monthly_targets
+     WHERE year = ? AND month BETWEEN 1 AND ?
+     GROUP BY category`,
+    [year, throughMonth]
+  );
+  const result = {};
+  for (const row of rows) {
+    result[row.category] = Number(row.total) || 0;
+  }
+  return result;
+}
+
+// Insert or update a single monthly target.
+async function upsertTarget(year, month, category, value) {
+  await pool.execute(
+    `INSERT INTO monthly_targets (year, month, category, target_value)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE target_value = VALUES(target_value)`,
+    [year, month, category, value]
+  );
+}
+
 // Test database connection
 async function testConnection() {
   try {
@@ -272,6 +349,12 @@ module.exports = {
   loadDailyRecords,
   saveDetectionLog,
   getDetectionLogs,
+  getAggregateByCategory,
+  getLatestDayWithData,
+  getKnownCategories,
+  getTargets,
+  getTargetsYTD,
+  upsertTarget,
   testConnection,
   toMySQLDate,
   toDisplayDate,

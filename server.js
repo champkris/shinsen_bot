@@ -120,7 +120,7 @@ async function sendNotificationToGroups(date, categories) {
     return;
   }
 
-  const message = `Report for ${date} has been recorded\n\nCategories: ${categories.join(', ')}\n\nView report: https://shinsen.yushi-marketing.com/daily-report`;
+  const message = `Report for ${date} has been recorded\n\nCategories: ${categories.join(', ')}\n\nDaily report: https://shinsen.yushi-marketing.com/daily-report\nMTD / YTD report: https://shinsen.yushi-marketing.com/mtd-report`;
   console.log(`[NOTIFICATION] Message to send: ${message}`);
 
   for (const groupId of NOTIFICATION_GROUP_IDS) {
@@ -745,6 +745,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 
 // Add JSON parsing middleware for other endpoints (after LINE webhook)
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 async function handleEvent(event) {
   console.log('[EVENT] Event type:', event.type);
@@ -793,7 +794,7 @@ async function handleEvent(event) {
 
         // Only send reply if data was successfully recorded
         if (recordResult && recordResult.success) {
-          const replyMessage = `Report for ${recordResult.date} has been recorded\n\nView report: https://shinsen.yushi-marketing.com/daily-report`;
+          const replyMessage = `Report for ${recordResult.date} has been recorded\n\nDaily report: https://shinsen.yushi-marketing.com/daily-report\nMTD / YTD report: https://shinsen.yushi-marketing.com/mtd-report`;
 
           await client.replyMessage({
             replyToken: event.replyToken,
@@ -1876,6 +1877,432 @@ app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (re
   } catch (error) {
     console.error('[ERROR] Test OCR error:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ---------- MTD / YTD Report ----------
+
+const THAI_MONTHS = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+function ymd(y, m, d) { return `${y}-${pad2(m)}-${pad2(d)}`; }
+function formatInt(n) { return (n == null || Number.isNaN(n)) ? '-' : Math.round(n).toLocaleString('en-US'); }
+function formatThaiDate(y, m, d) { return `${d} ${THAI_MONTHS[m - 1]} ${y}`; }
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅' };
+const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336' };
+
+// Pick progress-bar color based on achievement % (Volume vs Target).
+function progressBarColor(pct) {
+  if (pct >= 100) return '#1b7a2f';   // hit/exceeded target — dark green
+  if (pct >= 80)  return '#4CAF50';   // close — green
+  if (pct >= 50)  return '#ff9800';   // on the way — orange
+  return '#e53935';                   // far off — red
+}
+
+function buildProgressCell(volume, target, yoy) {
+  const yoyLine = yoy > 0
+    ? `<div class="progress-yoy">ปีก่อน: ${formatInt(yoy)}</div>`
+    : `<div class="progress-yoy" style="color:#aaa;">ปีก่อน: —</div>`;
+
+  if (!target || target <= 0) {
+    return `
+      <td>
+        <div class="progress-wrap">
+          <div class="progress-head"><b>${formatInt(volume)}</b> <span style="color:#888;">/ ยังไม่ได้ตั้ง target</span></div>
+          <div class="progress-track"><div class="progress-fill" style="width:0%;"></div></div>
+          ${yoyLine}
+        </div>
+      </td>`;
+  }
+
+  const pct = (volume / target) * 100;
+  const fillWidth = Math.min(pct, 100);
+  const color = progressBarColor(pct);
+  return `
+    <td>
+      <div class="progress-wrap">
+        <div class="progress-head">
+          <b>${formatInt(volume)}</b> <span style="color:#888;">/ ${formatInt(target)}</span>
+          <span class="progress-pct" style="color:${color};">(${pct.toFixed(1)}%)</span>
+        </div>
+        <div class="progress-track"><div class="progress-fill" style="width:${fillWidth}%; background:${color};"></div></div>
+        ${yoyLine}
+      </div>
+    </td>`;
+}
+
+function buildReportRow(category, volume, target, yoy) {
+  const hasYoy = yoy > 0;
+  let growthCell;
+  if (!hasYoy) {
+    growthCell = `<td style="color:#1b7a2f;font-weight:600;font-size:16px;">+${formatInt(volume)}</td>`;
+  } else {
+    const pct = ((volume - yoy) / yoy) * 100;
+    const color = pct >= 0 ? '#1b7a2f' : '#c62828';
+    const sign = pct >= 0 ? '+' : '';
+    growthCell = `<td style="color:${color};font-weight:600;font-size:16px;">${sign}${pct.toFixed(1)}%</td>`;
+  }
+  const name = db.CATEGORY_NAMES[category] || category;
+  const icon = CATEGORY_ICONS[category] || '';
+  const color = CATEGORY_COLORS[category] || '#4CAF50';
+  return `
+    <tr>
+      <td style="text-align:left;font-weight:600;color:${color};white-space:nowrap;">${icon} ${escapeHtml(name)}</td>
+      ${buildProgressCell(volume, target, yoy)}
+      ${growthCell}
+    </tr>`;
+}
+
+// Shared CSS/nav used by /mtd-report and /targets — mirrors the /daily-report look.
+function reportSharedStyles() {
+  return `
+    body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+    .container { max-width: 100%; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { text-align: center; color: #333; margin-bottom: 10px; }
+    .subtitle { text-align: center; color: #555; margin-bottom: 24px; }
+    .nav { margin-bottom: 20px; text-align: center; }
+    .nav a { padding: 10px 20px; background-color: #4CAF50; color: white; text-decoration: none; margin: 0 5px; border-radius: 5px; display: inline-block; }
+    .nav a:hover { background-color: #45a049; }
+    .filter-section { margin-bottom: 30px; text-align: center; padding: 20px; background-color: #f0f0f0; border-radius: 8px; }
+    .filter-section label { font-weight: bold; font-size: 16px; margin-right: 10px; }
+    .filter-section select { padding: 8px 15px; font-size: 16px; border: 2px solid #4CAF50; border-radius: 5px; background-color: white; cursor: pointer; transition: border-color 0.3s; }
+    .filter-section select:hover { border-color: #45a049; }
+    .filter-section select:focus { outline: none; border-color: #2196F3; }
+    .summary { display: flex; justify-content: space-around; margin-bottom: 30px; flex-wrap: wrap; }
+    .summary-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; min-width: 200px; text-align: center; margin: 10px; }
+    .summary-number { font-size: 32px; font-weight: bold; }
+    .summary-label { font-size: 14px; opacity: 0.9; }
+    .section { margin-bottom: 40px; padding: 20px; border-radius: 8px; background-color: #fafafa; border-left: 5px solid #4CAF50; }
+    .section-title { font-size: 22px; font-weight: bold; margin-bottom: 15px; color: #333; }
+    .chart-container { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    table { border-collapse: collapse; width: 100%; background-color: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; }
+    th, td { border: 1px solid #ccc; padding: 10px 8px; text-align: center; }
+    th { background-color: #4CAF50; color: white; font-weight: bold; white-space: nowrap; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    tr:hover { background-color: #f1f1f1; }
+    .no-data { padding: 20px; text-align: center; color: #666; font-style: italic; }
+    .notice { background:#e8f5e9; border:1px solid #a5d6a7; color:#2e7d32; padding:10px 12px; border-radius:4px; margin: 0 auto 16px auto; max-width: 600px; text-align: center; }
+    form.target-form table { max-width: 700px; margin: 0 auto; }
+    form.target-form input[type=number] { width: 160px; padding: 8px; font-size: 14px; border: 2px solid #ccc; border-radius: 4px; }
+    form.target-form input[type=number]:focus { outline: none; border-color: #4CAF50; }
+    .save-btn { display: block; margin: 20px auto 0; padding: 12px 28px; font-size: 16px; background:#4CAF50; color:#fff; border:0; border-radius:5px; cursor:pointer; }
+    .save-btn:hover { background:#45a049; }
+    .progress-wrap { min-width: 240px; text-align: left; padding: 4px 0; }
+    .progress-head { font-size: 14px; margin-bottom: 6px; }
+    .progress-head b { font-size: 16px; }
+    .progress-pct { margin-left: 6px; font-weight: 600; }
+    .progress-track { width: 100%; height: 10px; background: #e0e0e0; border-radius: 5px; overflow: hidden; }
+    .progress-fill { height: 100%; transition: width 0.4s ease; border-radius: 5px; }
+    .progress-yoy { margin-top: 6px; font-size: 12px; color: #777; }
+    .no-yoy { display: inline-block; color: #888; font-size: 13px; font-style: italic; }
+  `;
+}
+
+function reportNav() {
+  return `
+    <div class="nav">
+      <a href="/daily-report">Daily Report</a>
+      <a href="/mtd-report">MTD/YTD Report</a>
+      <a href="/targets">Manage Targets</a>
+      <a href="/detection-logs">Detection Logs</a>
+    </div>`;
+}
+
+app.get('/mtd-report', async (req, res) => {
+  try {
+    const now = new Date();
+    const y = parseInt(req.query.year, 10) || now.getFullYear();
+    const m = parseInt(req.query.month, 10) || (now.getMonth() + 1);
+    if (m < 1 || m > 12) return res.status(400).send('Invalid month');
+
+    const lastDayOfMonth = new Date(y, m, 0).getDate();
+    const isCurrentMonth = (y === now.getFullYear() && m === now.getMonth() + 1);
+    const isFuture = (y > now.getFullYear()) || (y === now.getFullYear() && m > now.getMonth() + 1);
+
+    // Resolve "as of" day: current month uses the latest date that has data
+    // (or today if no data yet), past/future months use the last day of month.
+    let d;
+    if (isCurrentMonth) {
+      const latest = await db.getLatestDayWithData(y, m);
+      d = latest || Math.min(now.getDate(), lastDayOfMonth);
+    } else if (isFuture) {
+      d = lastDayOfMonth;
+    } else {
+      d = lastDayOfMonth;
+    }
+    const prevY = y - 1;
+
+    const mtdStart = ymd(y, m, 1);
+    const mtdEnd = ymd(y, m, d);
+    const ytdStart = ymd(y, 1, 1);
+    const ytdEnd = ymd(y, m, d);
+    const mtdPyStart = ymd(prevY, m, 1);
+    const mtdPyEnd = ymd(prevY, m, d);
+    const ytdPyStart = ymd(prevY, 1, 1);
+    const ytdPyEnd = ymd(prevY, m, d);
+
+    const [
+      mtdAgg, ytdAgg, mtdPyAgg, ytdPyAgg,
+      currentTargets, ytdTargets
+    ] = await Promise.all([
+      db.getAggregateByCategory(mtdStart, mtdEnd),
+      db.getAggregateByCategory(ytdStart, ytdEnd),
+      db.getAggregateByCategory(mtdPyStart, mtdPyEnd),
+      db.getAggregateByCategory(ytdPyStart, ytdPyEnd),
+      db.getTargets(y, m),
+      db.getTargetsYTD(y, m)
+    ]);
+
+    // Show only categories that have sales in each respective period.
+    // Canonical order first, then any new category names.
+    const orderCategories = (keys) => {
+      const setObj = new Set(keys);
+      const arr = [];
+      for (const c of db.CATEGORIES) if (setObj.has(c)) arr.push(c);
+      for (const c of setObj) if (!db.CATEGORIES.includes(c)) arr.push(c);
+      return arr;
+    };
+    const mtdOrdered = orderCategories(Object.keys(mtdAgg).filter(c => (mtdAgg[c] || 0) > 0));
+    const ytdOrdered = orderCategories(Object.keys(ytdAgg).filter(c => (ytdAgg[c] || 0) > 0));
+
+    const mtdRows = mtdOrdered.map(c => buildReportRow(c, mtdAgg[c] || 0, currentTargets[c] || 0, mtdPyAgg[c] || 0)).join('');
+    const ytdRows = ytdOrdered.map(c => buildReportRow(c, ytdAgg[c] || 0, ytdTargets[c] || 0, ytdPyAgg[c] || 0)).join('');
+
+    const asOfLabel = formatThaiDate(y, m, d);
+    const pyLabel = formatThaiDate(prevY, m, d);
+
+    const yearOptions = [];
+    for (let yy = now.getFullYear() - 2; yy <= now.getFullYear() + 1; yy++) {
+      yearOptions.push(`<option value="${yy}"${yy === y ? ' selected' : ''}>${yy}</option>`);
+    }
+    const monthOptions = THAI_MONTHS.map((name, i) =>
+      `<option value="${i + 1}"${i + 1 === m ? ' selected' : ''}>${name}</option>`
+    ).join('');
+
+    const asOfNote = isCurrentMonth
+      ? `<span style="color:#555;font-size:13px;">(เดือนปัจจุบัน — ข้อมูลถึงวันล่าสุดที่บันทึก)</span>`
+      : '';
+
+    const sumVals = obj => Object.values(obj).reduce((s, v) => s + (v || 0), 0);
+    const mtdTotalVol = sumVals(mtdAgg);
+    const ytdTotalVol = sumVals(ytdAgg);
+    const mtdTotalPy = sumVals(mtdPyAgg);
+    const ytdTotalPy = sumVals(ytdPyAgg);
+    const mtdTotalGrowth = mtdTotalPy > 0 ? ((mtdTotalVol - mtdTotalPy) / mtdTotalPy) * 100 : null;
+    const ytdTotalGrowth = ytdTotalPy > 0 ? ((ytdTotalVol - ytdTotalPy) / ytdTotalPy) * 100 : null;
+
+    const growthBadge = (pct) => {
+      if (pct === null) return '<span style="opacity:0.8;">N/A</span>';
+      const sign = pct >= 0 ? '+' : '';
+      return `${sign}${pct.toFixed(1)}%`;
+    };
+
+    const hasAny = mtdOrdered.length > 0 || ytdOrdered.length > 0;
+    const emptyRow = '<tr><td colspan="3" class="no-data">ไม่มีสินค้าที่มียอดขายในช่วงนี้</td></tr>';
+
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>MTD / YTD Report</title>
+  <meta charset="utf-8">
+  <style>${reportSharedStyles()}</style>
+</head>
+<body>
+  <div class="container">
+    ${reportNav()}
+    <h1>📈 MTD / YTD Report</h1>
+    <div class="subtitle">ข้อมูล ณ วันที่ <b>${asOfLabel}</b> เทียบปีก่อน <b>${pyLabel}</b><br>${asOfNote}</div>
+
+    <div class="filter-section">
+      <label for="month-filter">Month:</label>
+      <select id="month-filter" onchange="applyFilter()">${monthOptions}</select>
+      <label for="year-filter" style="margin-left: 20px;">Year:</label>
+      <select id="year-filter" onchange="applyFilter()">${yearOptions}</select>
+    </div>
+
+    ${hasAny ? `
+    <div class="summary">
+      <div class="summary-card">
+        <div class="summary-number">${formatInt(mtdTotalVol)}</div>
+        <div class="summary-label">Volume MTD · Growth ${growthBadge(mtdTotalGrowth)}</div>
+      </div>
+      <div class="summary-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
+        <div class="summary-number">${formatInt(ytdTotalVol)}</div>
+        <div class="summary-label">Volume YTD · Growth ${growthBadge(ytdTotalGrowth)}</div>
+      </div>
+    </div>
+    ` : ''}
+
+    ${!hasAny ? '<div class="no-data" style="padding: 40px;">ไม่มีข้อมูลในช่วงที่เลือก</div>' : ''}
+
+    ${hasAny ? `
+    <div class="section">
+      <div class="section-title">🗓️ Month-to-Date (${THAI_MONTHS[m - 1]} ${y})</div>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Volume / Target (${THAI_MONTHS[m - 1]})</th>
+            <th>vs ปีก่อน (${prevY})</th>
+          </tr>
+        </thead>
+        <tbody>${mtdRows || emptyRow}</tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="section" style="border-left-color: #11998e;">
+      <div class="section-title" style="color:#11998e;">📅 Year-to-Date (${y})</div>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Volume / Target YTD (ม.ค.–${THAI_MONTHS[m - 1]})</th>
+            <th>vs ปีก่อน (${prevY})</th>
+          </tr>
+        </thead>
+        <tbody>${ytdRows || emptyRow}</tbody>
+      </table>
+      </div>
+    </div>
+    ` : ''}
+  </div>
+
+  <script>
+    function applyFilter() {
+      const month = document.getElementById('month-filter').value;
+      const year = document.getElementById('year-filter').value;
+      window.location.href = '/mtd-report?month=' + month + '&year=' + year;
+    }
+  </script>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('[MTD] Error:', err);
+    res.status(500).send('Error loading MTD report: ' + escapeHtml(err.message));
+  }
+});
+
+// ---------- Target management ----------
+
+app.get('/targets', async (req, res) => {
+  try {
+    const now = new Date();
+    const y = parseInt(req.query.year, 10) || now.getFullYear();
+    const m = parseInt(req.query.month, 10) || (now.getMonth() + 1);
+
+    const [currentTargets, knownCats] = await Promise.all([
+      db.getTargets(y, m),
+      db.getKnownCategories()
+    ]);
+
+    const appearing = new Set([...Object.keys(currentTargets), ...knownCats, ...db.CATEGORIES]);
+    const ordered = [];
+    for (const c of db.CATEGORIES) if (appearing.has(c)) ordered.push(c);
+    for (const c of appearing) if (!db.CATEGORIES.includes(c)) ordered.push(c);
+
+    const rows = ordered.map(c => {
+      const current = currentTargets[c] || 0;
+      const name = db.CATEGORY_NAMES[c] || c;
+      const icon = CATEGORY_ICONS[c] || '';
+      const color = CATEGORY_COLORS[c] || '#4CAF50';
+      return `
+        <tr>
+          <td style="text-align:left;font-weight:600;color:${color};">${icon} ${escapeHtml(name)}</td>
+          <td><input type="number" min="0" step="1" name="target_${escapeHtml(c)}" value="${current}"></td>
+        </tr>`;
+    }).join('');
+
+    const yearOptions = [];
+    for (let yy = now.getFullYear() - 2; yy <= now.getFullYear() + 1; yy++) {
+      yearOptions.push(`<option value="${yy}"${yy === y ? ' selected' : ''}>${yy}</option>`);
+    }
+    const monthOptions = THAI_MONTHS.map((name, i) =>
+      `<option value="${i + 1}"${i + 1 === m ? ' selected' : ''}>${name}</option>`
+    ).join('');
+
+    const saved = req.query.saved === '1';
+
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Manage Targets</title>
+  <meta charset="utf-8">
+  <style>${reportSharedStyles()}</style>
+</head>
+<body>
+  <div class="container">
+    ${reportNav()}
+    <h1>🎯 Manage Monthly Targets</h1>
+    <div class="subtitle">ตั้งยอด target รายเดือนของแต่ละ category เพื่อใช้ใน MTD/YTD Report</div>
+
+    ${saved ? '<div class="notice">✅ บันทึก target เรียบร้อย</div>' : ''}
+
+    <div class="filter-section">
+      <label for="month-filter">Month:</label>
+      <select id="month-filter" onchange="applyFilter()">${monthOptions}</select>
+      <label for="year-filter" style="margin-left: 20px;">Year:</label>
+      <select id="year-filter" onchange="applyFilter()">${yearOptions}</select>
+    </div>
+
+    <form class="target-form" method="post" action="/targets">
+      <input type="hidden" name="year" value="${y}">
+      <input type="hidden" name="month" value="${m}">
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Target (${THAI_MONTHS[m - 1]} ${y})</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <button class="save-btn" type="submit">💾 บันทึก</button>
+    </form>
+  </div>
+
+  <script>
+    function applyFilter() {
+      const month = document.getElementById('month-filter').value;
+      const year = document.getElementById('year-filter').value;
+      window.location.href = '/targets?month=' + month + '&year=' + year;
+    }
+  </script>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('[TARGETS] Error:', err);
+    res.status(500).send('Error loading targets: ' + escapeHtml(err.message));
+  }
+});
+
+app.post('/targets', async (req, res) => {
+  try {
+    const y = parseInt(req.body.year, 10);
+    const m = parseInt(req.body.month, 10);
+    if (!y || !m || m < 1 || m > 12) {
+      return res.status(400).send('Invalid year or month');
+    }
+    const entries = Object.entries(req.body)
+      .filter(([k]) => k.startsWith('target_'))
+      .map(([k, v]) => [k.slice('target_'.length), parseInt(v, 10)])
+      .filter(([cat, val]) => cat && Number.isFinite(val) && val >= 0);
+
+    for (const [cat, val] of entries) {
+      await db.upsertTarget(y, m, cat, val);
+    }
+    console.log(`[TARGETS] Saved ${entries.length} targets for ${y}-${pad2(m)}`);
+    res.redirect(`/targets?year=${y}&month=${m}&saved=1`);
+  } catch (err) {
+    console.error('[TARGETS] Save error:', err);
+    res.status(500).send('Error saving targets: ' + escapeHtml(err.message));
   }
 });
 

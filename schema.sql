@@ -34,6 +34,19 @@ CREATE TABLE IF NOT EXISTS daily_records (
   INDEX idx_date_category (date, category)
 );
 
+-- Table: monthly_targets
+-- Stores sales targets per category per month
+CREATE TABLE IF NOT EXISTS monthly_targets (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  year INT NOT NULL,
+  month INT NOT NULL,
+  category VARCHAR(50) NOT NULL,
+  target_value BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY unique_target (year, month, category),
+  INDEX idx_year_month (year, month)
+);
+
 -- Table: detection_logs
 -- Stores logs from image detection attempts
 CREATE TABLE IF NOT EXISTS detection_logs (

@@ -1958,6 +1958,26 @@ function buildReportRow(category, volume, target, yoy) {
     </tr>`;
 }
 
+function buildReportTotalRow(volume, totalTarget, totalPy, accentColor) {
+  const hasYoy = totalPy > 0;
+  let growthCell;
+  if (!hasYoy) {
+    growthCell = `<td style="color:#1b7a2f;font-weight:700;font-size:16px;">+${formatInt(volume)}</td>`;
+  } else {
+    const pct = ((volume - totalPy) / totalPy) * 100;
+    const color = pct >= 0 ? '#1b7a2f' : '#c62828';
+    const sign = pct >= 0 ? '+' : '';
+    growthCell = `<td style="color:${color};font-weight:700;font-size:16px;">${sign}${pct.toFixed(1)}%</td>`;
+  }
+  const accent = accentColor || '#333';
+  return `
+    <tr style="background:#f5f5f5;border-top:2px solid #ccc;">
+      <td style="text-align:left;font-weight:700;color:${accent};white-space:nowrap;">รวม</td>
+      ${buildProgressCell(volume, totalTarget, totalPy)}
+      ${growthCell}
+    </tr>`;
+}
+
 // Shared CSS/nav used by /mtd-report and /targets — mirrors the /daily-report look.
 function reportSharedStyles() {
   return `
@@ -2072,6 +2092,9 @@ app.get('/mtd-report', async (req, res) => {
 
     const mtdRows = mtdOrdered.map(c => buildReportRow(c, mtdAgg[c] || 0, currentTargets[c] || 0, mtdPyAgg[c] || 0)).join('');
     const ytdRows = ytdOrdered.map(c => buildReportRow(c, ytdAgg[c] || 0, ytdTargets[c] || 0, ytdPyAgg[c] || 0)).join('');
+    const sumTargetsFor = (obj, cats) => cats.reduce((s, c) => s + (Number(obj[c]) || 0), 0);
+    const mtdTotalTarget = sumTargetsFor(currentTargets, mtdOrdered);
+    const ytdTotalTarget = sumTargetsFor(ytdTargets, ytdOrdered);
 
     const asOfLabel = formatThaiDate(y, m, d);
     const pyLabel = formatThaiDate(prevY, m, d);
@@ -2093,14 +2116,6 @@ app.get('/mtd-report', async (req, res) => {
     const ytdTotalVol = sumVals(ytdAgg);
     const mtdTotalPy = sumVals(mtdPyAgg);
     const ytdTotalPy = sumVals(ytdPyAgg);
-    const mtdTotalGrowth = mtdTotalPy > 0 ? ((mtdTotalVol - mtdTotalPy) / mtdTotalPy) * 100 : null;
-    const ytdTotalGrowth = ytdTotalPy > 0 ? ((ytdTotalVol - ytdTotalPy) / ytdTotalPy) * 100 : null;
-
-    const growthBadge = (pct) => {
-      if (pct === null) return '<span style="opacity:0.8;">N/A</span>';
-      const sign = pct >= 0 ? '+' : '';
-      return `${sign}${pct.toFixed(1)}%`;
-    };
 
     const hasAny = mtdOrdered.length > 0 || ytdOrdered.length > 0;
     const emptyRow = '<tr><td colspan="3" class="no-data">ไม่มีสินค้าที่มียอดขายในช่วงนี้</td></tr>';
@@ -2125,19 +2140,6 @@ app.get('/mtd-report', async (req, res) => {
       <select id="year-filter" onchange="applyFilter()">${yearOptions}</select>
     </div>
 
-    ${hasAny ? `
-    <div class="summary">
-      <div class="summary-card">
-        <div class="summary-number">${formatInt(mtdTotalVol)}</div>
-        <div class="summary-label">Volume MTD · Growth ${growthBadge(mtdTotalGrowth)}</div>
-      </div>
-      <div class="summary-card" style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);">
-        <div class="summary-number">${formatInt(ytdTotalVol)}</div>
-        <div class="summary-label">Volume YTD · Growth ${growthBadge(ytdTotalGrowth)}</div>
-      </div>
-    </div>
-    ` : ''}
-
     ${!hasAny ? '<div class="no-data" style="padding: 40px;">ไม่มีข้อมูลในช่วงที่เลือก</div>' : ''}
 
     ${hasAny ? `
@@ -2152,7 +2154,7 @@ app.get('/mtd-report', async (req, res) => {
             <th>vs ปีก่อน (${prevY})</th>
           </tr>
         </thead>
-        <tbody>${mtdRows || emptyRow}</tbody>
+        <tbody>${mtdRows || emptyRow}${mtdOrdered.length > 0 ? buildReportTotalRow(mtdTotalVol, mtdTotalTarget, mtdTotalPy, '#333') : ''}</tbody>
       </table>
       </div>
     </div>
@@ -2168,7 +2170,7 @@ app.get('/mtd-report', async (req, res) => {
             <th>vs ปีก่อน (${prevY})</th>
           </tr>
         </thead>
-        <tbody>${ytdRows || emptyRow}</tbody>
+        <tbody>${ytdRows || emptyRow}${ytdOrdered.length > 0 ? buildReportTotalRow(ytdTotalVol, ytdTotalTarget, ytdTotalPy, '#11998e') : ''}</tbody>
       </table>
       </div>
     </div>

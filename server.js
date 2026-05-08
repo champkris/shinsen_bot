@@ -2015,16 +2015,23 @@ function reportSharedStyles() {
 }
 
 function reportNav() {
+  const navStyle = 'display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin-bottom:24px;';
+  const linkBase = 'padding:10px 18px; color:white; text-decoration:none; border-radius:5px; font-size:14px; font-weight:500; white-space:nowrap; transition:opacity 0.2s;';
+  const reportBg = 'background-color:#4CAF50;';   // primary reports — green
+  const dataBg = 'background-color:#607D8B;';     // data inspection — slate
+  const actionBg = 'background-color:#2196F3;';   // send — blue
+  const devBg = 'background-color:#FF9800;';      // dev/test — orange
+
   return `
-    <div class="nav">
-      <a href="/latest-ocr">Original Table</a>
-      <a href="/transformed-data">Transformed Data</a>
-      <a href="/daily-report">Daily Report</a>
-      <a href="/mtd-report">MTD/YTD Report</a>
-      <a href="/targets">Manage Targets</a>
-      <a href="/detection-logs">Detection Logs</a>
-      <a href="/send-notification">Send Notification</a>
-      <a href="/test">Test OCR</a>
+    <div class="nav" style="${navStyle}">
+      <a href="/daily-report" style="${linkBase}${reportBg}">📊 Daily Report</a>
+      <a href="/mtd-report" style="${linkBase}${reportBg}">📈 MTD/YTD Report</a>
+      <a href="/targets" style="${linkBase}${reportBg}">🎯 Manage Targets</a>
+      <a href="/latest-ocr" style="${linkBase}${dataBg}">📄 Original Table</a>
+      <a href="/transformed-data" style="${linkBase}${dataBg}">🔄 Transformed Data</a>
+      <a href="/detection-logs" style="${linkBase}${dataBg}">📋 Detection Logs</a>
+      <a href="/send-notification" style="${linkBase}${actionBg}">📢 Send Notification</a>
+      <a href="/test" style="${linkBase}${devBg}">🧪 Test OCR</a>
     </div>`;
 }
 

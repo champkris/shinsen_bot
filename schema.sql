@@ -6,11 +6,11 @@ USE shinsen_bot;
 
 -- Table: daily_records
 -- Stores daily sales records for all product categories
--- Categories: orange, yuzu, pop (Shinsen Pop), mixed (น้ำผลไม้รวม), tomato (Tomato Yuzu)
+-- Categories: orange, yuzu, pop (Shinsen Pop), mixed (น้ำผลไม้รวม), tomato (Tomato Yuzu), pineapple (น้ำสับปะรด)
 CREATE TABLE IF NOT EXISTS daily_records (
   id INT AUTO_INCREMENT PRIMARY KEY,
   date DATE NOT NULL,
-  category ENUM('orange', 'yuzu', 'pop', 'mixed', 'tomato') NOT NULL,
+  category ENUM('orange', 'yuzu', 'pop', 'mixed', 'tomato', 'pineapple') NOT NULL,
   timestamp DATETIME NOT NULL,
   fc33_hadyai_sum INT DEFAULT 0,
   total_sum INT DEFAULT 0,

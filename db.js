@@ -56,7 +56,7 @@ function toDisplayDate(mysqlDate) {
 }
 
 // All supported product categories
-const CATEGORIES = ['orange', 'yuzu', 'pop', 'mixed', 'tomato'];
+const CATEGORIES = ['orange', 'yuzu', 'pop', 'mixed', 'tomato', 'pineapple'];
 
 // Category display names (Thai)
 const CATEGORY_NAMES = {
@@ -64,7 +64,8 @@ const CATEGORY_NAMES = {
   yuzu: 'ยูซุ',
   pop: 'Shinsen Pop',
   mixed: 'น้ำผลไม้รวม',
-  tomato: 'Tomato Yuzu'
+  tomato: 'Tomato Yuzu',
+  pineapple: 'น้ำสับปะรด'
 };
 
 // Convert record from database format to application format

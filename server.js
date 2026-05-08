@@ -173,6 +173,10 @@ const PRODUCT_DETECTION = {
   tomato: {
     keywords: ['tomato', 'มะเขือเทศ'],
     dbCategory: 'tomato'
+  },
+  pineapple: {
+    keywords: ['สับปะรด', 'pineapple'],
+    dbCategory: 'pineapple'
   }
 };
 
@@ -1322,7 +1326,8 @@ app.get('/daily-report', async (req, res) => {
       yuzu: { records: records.yuzu || [], name: 'Yuzu', thaiName: 'ยูซุ', icon: '🍋', bgColor: '#fffde7', borderColor: '#fdd835' },
       pop: { records: records.pop || [], name: 'Shinsen Pop', thaiName: 'Shinsen Pop', icon: '🍹', bgColor: '#e1f5fe', borderColor: '#03a9f4' },
       mixed: { records: records.mixed || [], name: 'Mixed Fruit', thaiName: 'น้ำผลไม้รวม', icon: '🍇', bgColor: '#f3e5f5', borderColor: '#9c27b0' },
-      tomato: { records: records.tomato || [], name: 'Tomato Yuzu', thaiName: 'Tomato Yuzu', icon: '🍅', bgColor: '#ffebee', borderColor: '#f44336' }
+      tomato: { records: records.tomato || [], name: 'Tomato Yuzu', thaiName: 'Tomato Yuzu', icon: '🍅', bgColor: '#ffebee', borderColor: '#f44336' },
+      pineapple: { records: records.pineapple || [], name: 'Pineapple', thaiName: 'น้ำสับปะรด', icon: '🍍', bgColor: '#f9fbe7', borderColor: '#cddc39' }
     };
 
     // Generate tables for each category
@@ -1893,8 +1898,8 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅' };
-const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336' };
+const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅', pineapple: '🍍' };
+const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336', pineapple: '#cddc39' };
 
 // Pick progress-bar color based on achievement % (Volume vs Target).
 function progressBarColor(pct) {

@@ -1229,6 +1229,7 @@ app.get('/latest-ocr', (req, res) => {
         <a href="/latest-ocr">Original Table</a>
         <a href="/transformed-data">Transformed Data</a>
         <a href="/daily-report">Daily Report</a>
+        <a href="/mtd-report">MTD/YTD Report</a>
       </div>
 
       <h1>Latest OCR Result</h1>
@@ -1291,6 +1292,7 @@ app.get('/transformed-data', (req, res) => {
         <a href="/latest-ocr">Original Table</a>
         <a href="/transformed-data">Transformed Data</a>
         <a href="/daily-report">Daily Report</a>
+        <a href="/mtd-report">MTD/YTD Report</a>
       </div>
 
       <h1>Transformed Data (CDC Summary)</h1>
@@ -1540,6 +1542,7 @@ app.get('/daily-report', async (req, res) => {
             <a href="/latest-ocr">Original Table</a>
             <a href="/transformed-data">Transformed Data</a>
             <a href="/daily-report">Daily Report</a>
+            <a href="/mtd-report">MTD/YTD Report</a>
             <a href="/detection-logs">Detection Logs</a>
             <a href="/send-notification" style="background-color: #2196F3;">Send Notification</a>
           </div>
@@ -2377,6 +2380,7 @@ app.get('/test', (req, res) => {
         <a href="/latest-ocr">Original Table</a>
         <a href="/transformed-data">Transformed Data</a>
         <a href="/daily-report">Daily Report</a>
+        <a href="/mtd-report">MTD/YTD Report</a>
         <a href="/detection-logs">Detection Logs</a>
         <a href="/test">Test OCR</a>
       </div>
@@ -2657,6 +2661,7 @@ app.get('/detection-logs', async (req, res) => {
             <a href="/latest-ocr">Original Table</a>
             <a href="/transformed-data">Transformed Data</a>
             <a href="/daily-report">Daily Report</a>
+            <a href="/mtd-report">MTD/YTD Report</a>
             <a href="/detection-logs">Detection Logs</a>
             <a href="/send-notification" style="background-color: #2196F3;">Send Notification</a>
           </div>
@@ -2877,6 +2882,7 @@ app.get('/send-notification', (req, res) => {
       <div class="container">
         <div class="nav">
           <a href="/daily-report">Daily Report</a>
+          <a href="/mtd-report">MTD/YTD Report</a>
           <a href="/detection-logs">Detection Logs</a>
           <a href="/send-notification">Send Notification</a>
         </div>

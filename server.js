@@ -153,9 +153,12 @@ async function isDateRecorded(date, category) {
 }
 
 // Product detection configuration - keywords to identify each product in column headers
+// Detection uses longest-matching-keyword scoring: when multiple products match the same cell,
+// the product with the longest matching keyword wins (e.g. "มุกป๊อป" beats "น้ำส้ม" in
+// "น้ำส้มมุกป๊อป" — pop wins over orange).
 const PRODUCT_DETECTION = {
   orange: {
-    keywords: ['ส้ม', 'orange', 'น้ำส้ม'],
+    keywords: ['น้ำส้ม', 'orange', 'ส้ม'],
     dbCategory: 'orange'
   },
   yuzu: {
@@ -163,11 +166,11 @@ const PRODUCT_DETECTION = {
     dbCategory: 'yuzu'
   },
   pop: {
-    keywords: ['pop', 'shinsen pop', 'ป๊อป', 'มุกป๊อป'],
+    keywords: ['shinsen pop', 'มุกป๊อป', 'ป๊อป', 'pop'],
     dbCategory: 'pop'
   },
   mixed: {
-    keywords: ['ผลไม้รวม', 'น้ำผลไม้รวม', 'mixed fruit'],
+    keywords: ['น้ำผลไม้รวม', 'ผลไม้รวม', 'mixed fruit'],
     dbCategory: 'mixed'
   },
   tomato: {
@@ -232,46 +235,133 @@ const CDC_NAME_MAPPING = {
   'ขอนแก่น': 'ขอนแก่น'
 };
 
-// Detect product columns from table headers
+// Detect product columns from table headers using longest-keyword-match scoring.
+// For each cell, find the product with the longest matching keyword. Then each column
+// is "won" by its highest-scoring product. Each product is assigned to its best-won column.
+// This resolves substring collisions like "น้ำส้ม" ⊂ "น้ำส้มมุกป๊อป" — pop's "มุกป๊อป" (7)
+// beats orange's "น้ำส้ม" (6), so pop wins that column.
 function detectProductColumns(table) {
-  const detectedProducts = {};
+  console.log('[DETECT] Scanning table for product columns (longest-match scoring)...');
 
-  console.log('[DETECT] Scanning table for product columns...');
-
-  // Scan first 10 rows for header information
+  // Stage 1: collect best (productKey, score) per (rowIdx, colIdx) cell
+  const cellMatches = [];
   for (let rowIdx = 0; rowIdx < Math.min(10, table.length); rowIdx++) {
     const row = table[rowIdx];
     if (!row) continue;
 
-    // Check each column in this row
     for (let colIdx = 0; colIdx < row.length; colIdx++) {
-      const cellText = row[colIdx] ? row[colIdx].toString().toLowerCase().trim() : '';
+      const cellRaw = row[colIdx];
+      const cellText = cellRaw ? cellRaw.toString().toLowerCase().trim() : '';
       if (!cellText) continue;
 
-      // Check against each product's keywords
+      let best = null;
       for (const [productKey, productConfig] of Object.entries(PRODUCT_DETECTION)) {
-        // Skip if already detected
-        if (detectedProducts[productKey]) continue;
-
-        // Check if any keyword matches
-        const matched = productConfig.keywords.some(keyword =>
-          cellText.includes(keyword.toLowerCase())
-        );
-
-        if (matched) {
-          detectedProducts[productKey] = {
-            column: colIdx,
-            dbCategory: productConfig.dbCategory,
-            foundIn: `Row ${rowIdx}, Col ${colIdx}: "${row[colIdx]}"`
-          };
-          console.log(`[DETECT] Found ${productKey} in column ${colIdx} (Row ${rowIdx}: "${row[colIdx]}")`);
+        let longest = 0;
+        for (const keyword of productConfig.keywords) {
+          const kw = keyword.toLowerCase();
+          if (cellText.includes(kw) && kw.length > longest) {
+            longest = kw.length;
+          }
         }
+        if (longest > 0 && (!best || longest > best.score)) {
+          best = { productKey, score: longest, dbCategory: productConfig.dbCategory };
+        }
+      }
+
+      if (best) {
+        cellMatches.push({
+          rowIdx, colIdx,
+          productKey: best.productKey,
+          score: best.score,
+          dbCategory: best.dbCategory,
+          cellText: cellRaw
+        });
+        console.log(`[DETECT] Row ${rowIdx} Col ${colIdx} "${cellRaw}" → ${best.productKey} (score ${best.score})`);
       }
     }
   }
 
+  // Stage 2: for each column, the highest-scoring product wins
+  const colWinner = new Map(); // colIdx → match
+  for (const m of cellMatches) {
+    const existing = colWinner.get(m.colIdx);
+    if (!existing || m.score > existing.score) {
+      colWinner.set(m.colIdx, m);
+    }
+  }
+
+  // Stage 3: each product is assigned to the best column it won
+  const productBest = {}; // productKey → match
+  for (const m of colWinner.values()) {
+    const existing = productBest[m.productKey];
+    if (!existing || m.score > existing.score) {
+      productBest[m.productKey] = m;
+    }
+  }
+
+  const detectedProducts = {};
+  for (const [productKey, m] of Object.entries(productBest)) {
+    detectedProducts[productKey] = {
+      column: m.colIdx,
+      dbCategory: m.dbCategory,
+      foundIn: `Row ${m.rowIdx}, Col ${m.colIdx}: "${m.cellText}"`
+    };
+    console.log(`[DETECT] Assigned ${productKey} → column ${m.colIdx} (Row ${m.rowIdx}: "${m.cellText}", score ${m.score})`);
+  }
+
+  // Fallback: recover orange when Azure OCR garbles "ส้ม" (observed: "ẫu", "ลม", etc.).
+  // Plan ส่งสินค้า has a fixed column order — orange sits immediately left of pop/pineapple,
+  // and every product column shares the "จำนวน น้ำ ___ (ขวด)" header pattern.
+  detectOrangeByPosition(table, detectedProducts);
+
   console.log(`[DETECT] Detected ${Object.keys(detectedProducts).length} products:`, Object.keys(detectedProducts));
   return detectedProducts;
+}
+
+// Fallback when keyword matching misses orange because Azure OCR misread "ส้ม".
+// Looks for an unclaimed column to the left of detected products whose header rows
+// match the canonical product-column shape ("จำนวน"/"น้ำ" + "(ขวด)").
+function detectOrangeByPosition(table, detectedProducts) {
+  if (detectedProducts.orange) return;
+
+  const claimedCols = new Set(Object.values(detectedProducts).map(p => p.column));
+  if (claimedCols.size === 0) return;
+
+  const minClaimedCol = Math.min(...claimedCols);
+
+  // Accumulate header text per column from the first few rows
+  const headerByCol = new Map();
+  for (let rowIdx = 0; rowIdx < Math.min(3, table.length); rowIdx++) {
+    const row = table[rowIdx];
+    if (!row) continue;
+    for (let colIdx = 0; colIdx < row.length; colIdx++) {
+      if (claimedCols.has(colIdx)) continue;
+      if (colIdx >= minClaimedCol) continue; // must sit left of detected products
+      if (colIdx < 2) continue;              // C0/C1 are vendor/warehouse, never products
+      const cellText = row[colIdx] ? row[colIdx].toString() : '';
+      if (!cellText) continue;
+      headerByCol.set(colIdx, (headerByCol.get(colIdx) || '') + ' ' + cellText);
+    }
+  }
+
+  // Pick the rightmost candidate (closest to detected products = most likely the missing product)
+  let chosenCol = null;
+  for (const [colIdx, text] of headerByCol) {
+    const hasKhuat = text.includes('ขวด');
+    const hasProductPrefix = text.includes('จำนวน') || text.includes('น้ำ');
+    if (hasKhuat && hasProductPrefix) {
+      if (chosenCol === null || colIdx > chosenCol) chosenCol = colIdx;
+    }
+  }
+
+  if (chosenCol !== null) {
+    detectedProducts.orange = {
+      column: chosenCol,
+      dbCategory: 'orange',
+      foundIn: `Position fallback col ${chosenCol} (OCR likely misread "ส้ม"; header: "${headerByCol.get(chosenCol).trim().substring(0, 40)}")`
+    };
+    console.log(`[DETECT] Fallback: assigned orange → column ${chosenCol} (OCR garbled header, position-inferred)`);
+  }
 }
 
 // Validate table has data (check FC33 หาดใหญ่ or FC07 ภูเก็ต in any detected product column)

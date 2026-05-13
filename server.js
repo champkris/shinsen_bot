@@ -374,16 +374,19 @@ function validateTableData(table, detectedProducts) {
 
   let hadyaiSum = 0;
   let phuketSum = 0;
+  const zeroCells = [];
 
   // Check all detected product columns for validation
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 3) return;
 
     const c0Cell = row[0] ? row[0].toString().trim() : '';
+    const isVendorRow = /FC\d+/.test(c0Cell);
 
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
-      const value = row[colIdx] ? parseOCRNumber(row[colIdx]) : 0;
+      const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
+      const value = parseOCRNumber(rawCell);
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
         hadyaiSum += value;
@@ -391,10 +394,27 @@ function validateTableData(table, detectedProducts) {
       if (c0Cell.includes('FC07')) {
         phuketSum += value;
       }
+
+      // Reject if a vendor row has an explicit "0" in a bottle-count column.
+      // Empty/blank cells from merged rows are ignored (no digits).
+      if (isVendorRow && rawCell !== '' && /[0-9]/.test(rawCell) && value === 0) {
+        zeroCells.push({ vendor: c0Cell.replace(/\s+/g, ' '), column: colIdx, rowIndex });
+      }
     });
   });
 
   console.log(`[VALIDATION] FC33 หาดใหญ่ sum: ${hadyaiSum}, FC07 ภูเก็ต sum: ${phuketSum}`);
+
+  if (zeroCells.length > 0) {
+    const preview = zeroCells.slice(0, 5).map(z => `${z.vendor}@col${z.column}`).join(', ');
+    console.log(`[VALIDATION] Found ${zeroCells.length} zero value(s) in bottle-count columns: ${preview}`);
+    return {
+      valid: false,
+      reason: `Found ${zeroCells.length} zero value(s) in bottle-count columns (e.g., ${preview}). Waiting for all bottle counts to be non-zero before recording.`,
+      hadyaiSum,
+      phuketSum
+    };
+  }
 
   if (hadyaiSum === 0 && phuketSum === 0) {
     return { valid: false, reason: 'Both FC33 หาดใหญ่ and FC07 ภูเก็ต sums are 0 (validation failed)', hadyaiSum, phuketSum };

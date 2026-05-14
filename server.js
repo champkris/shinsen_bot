@@ -533,27 +533,31 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
     if (rowIndex === totalsRowIndex) return;
+    if (!row[columnIndex]) return;
 
-    CDC_NAMES.forEach(cdcName => {
-      const fullCdcName = CDC_NAME_MAPPING[cdcName];
-      let searchCell;
+    // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
+    // C1 (source warehouse) is unreliable: fill-down can carry a previous vendor's
+    // warehouse name into the next vendor's first row, and a single row's value
+    // ends up double-counted across two CDCs.
+    const c0 = row[0] ? row[0].toString() : '';
+    if (!c0) return;
 
-      if (fullCdcName === 'คลังบางบัวทอง') {
-        searchCell = row[0] ? row[0].toString().trim() : '';
-      } else if (fullCdcName.startsWith('คลัง')) {
-        searchCell = row[1] ? row[1].toString().trim() : '';
-      } else {
-        searchCell = row[0] ? row[0].toString().trim() : '';
+    let bestCdcName = null;
+    let bestScore = 0;
+    for (const cdcName of CDC_NAMES) {
+      if (c0.includes(cdcName) && cdcName.length > bestScore) {
+        bestCdcName = cdcName;
+        bestScore = cdcName.length;
       }
+    }
+    if (!bestCdcName) return;
 
-      if (searchCell.includes(cdcName) && row[columnIndex]) {
-        const value = parseOCRNumber(row[columnIndex]);
-        const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
-        if (value > 0) {
-          cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
-        }
-      }
-    });
+    const fullCdcName = CDC_NAME_MAPPING[bestCdcName];
+    const value = parseOCRNumber(row[columnIndex]);
+    const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
+    if (value > 0) {
+      cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
+    }
   });
 
   // Ratio correction: fix truncated values where bottle/crate ratio is suspiciously low
@@ -1038,7 +1042,31 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
         }
 
         for (const cell of table.cells) {
-          tableRows[cell.rowIndex][cell.columnIndex] = cell.content || '';
+          const content = cell.content || '';
+          const rowIdx = cell.rowIndex;
+          const colIdx = cell.columnIndex;
+          const rowSpan = cell.rowSpan || 1;
+
+          // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
+          // a single multi-row cell. Split the content by FC code so fill-down later
+          // gives each row exactly one vendor instead of leaving both names in every row.
+          if (colIdx === 0 && rowSpan > 1) {
+            const fcParts = content
+              .split(/(?=FC\d+)/)
+              .map(p => p.trim())
+              .filter(p => /^FC\d+/.test(p));
+            if (fcParts.length > 1) {
+              const K = fcParts.length;
+              for (let i = 0; i < rowSpan; i++) {
+                const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
+                tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
+              }
+              console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
+              continue;
+            }
+          }
+
+          tableRows[rowIdx][colIdx] = content;
         }
 
         tableData.push(tableRows);
@@ -1172,40 +1200,30 @@ function transformTableData(tableData, columnIndex = 2) {
     cdcTotals[cdc] = 0;
   });
 
-  // Iterate through table rows and sum values based on CDC name
-  table.forEach((row, rowIndex) => {
+  // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
+  // Using C0 (with the FC code) avoids double-counting when C1 fill-down carries
+  // a previous vendor's warehouse into a later row.
+  table.forEach((row) => {
     if (!row || row.length < 2) return;
+    if (!row[columnIndex]) return;
 
-    // Find matching CDC name
-    cdcNames.forEach(cdcName => {
-      const fullCdcName = cdcNameMapping[cdcName];
+    const c0 = row[0] ? row[0].toString() : '';
+    if (!c0) return;
 
-      // Determine which column to search based on CDC name
-      let searchColumnIndex;
-      let searchCell;
-
-      if (fullCdcName.startsWith('คลัง')) {
-        // Search in C1 for locations starting with "คลัง"
-        searchColumnIndex = 1;
-        searchCell = row[1] ? row[1].toString().trim() : '';
-      } else {
-        // Search in C0 for other locations
-        searchColumnIndex = 0;
-        searchCell = row[0] ? row[0].toString().trim() : '';
+    let bestCdcName = null;
+    let bestScore = 0;
+    for (const cdcName of cdcNames) {
+      if (c0.includes(cdcName) && cdcName.length > bestScore) {
+        bestCdcName = cdcName;
+        bestScore = cdcName.length;
       }
+    }
+    if (!bestCdcName) return;
 
-      // Check if this row matches the CDC name
-      if (searchCell.includes(cdcName)) {
-        // Get value from the specified column (C2 for orange, C3 for yuzu)
-        if (row[columnIndex]) {
-          const value = parseOCRNumber(row[columnIndex]);
-
-          if (value > 0) {
-            cdcTotals[fullCdcName] += value;
-          }
-        }
-      }
-    });
+    const value = parseOCRNumber(row[columnIndex]);
+    if (value > 0) {
+      cdcTotals[cdcNameMapping[bestCdcName]] += value;
+    }
   });
 
   // Build transformed array in the defined order

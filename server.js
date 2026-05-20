@@ -527,7 +527,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   console.log(`[CDC] Extracting CDC values, excluding totals row index: ${totalsRowIndex}`);
 
   // Extract CDC values row by row, tracking individual contributions for ratio correction
-  const CRATE_TOTAL_COL = 6; // C6 = ตะกร้า รวม (total crates)
+  const CRATE_TOTAL_COL = 7; // C7 = ตะกร้า รวม (total crates)
   const cdcRows = [];
 
   table.forEach((row, rowIndex) => {

@@ -604,18 +604,86 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
 }
 
 // Extract Khon Kaen Laos value for orange category
-function extractKhonKaenLaos(table, columnIndex) {
-  for (let i = table.length - 1; i >= 0; i--) {
+function extractKhonKaenLaos(table, columnIndex, productColumnIndices) {
+  // 1. Search for a row that explicitly contains both 'ขอนแก่น' and 'ลาว'/'laos'
+  for (let i = 0; i < table.length; i++) {
     const row = table[i];
     if (!row || !row[0]) continue;
 
-    const c0 = row[0].toString().trim();
-    if (c0.includes('ขอนแก่น') && row[columnIndex]) {
+    const c0 = row[0].toString().toLowerCase().trim();
+    if (c0.includes('ขอนแก่น') && (c0.includes('ลาว') || c0.includes('laos') || c0.includes('lao')) && row[columnIndex]) {
       const value = parseOCRNumber(row[columnIndex]);
-      console.log(`[LAOS] Found ขอนแก่น Laos value: ${value} in row ${i}`);
+      console.log(`[LAOS] Found explicit ขอนแก่น Laos row at index ${i}: "${row[0]}" with value ${value}`);
       return value;
     }
   }
+
+  // 2. Group Khon Kaen rows into logical slots
+  const khonKaenRows = [];
+  table.forEach((row, idx) => {
+    if (!row || !row[0]) return;
+    const c0 = row[0].toString().trim();
+    if (c0.includes('ขอนแก่น')) {
+      khonKaenRows.push({ rowIndex: idx, row });
+    }
+  });
+
+  const slots = [];
+  let currentSlot = [];
+  let lastColIndex = -1;
+
+  for (const entry of khonKaenRows) {
+    const row = entry.row;
+    const rowIndex = entry.rowIndex;
+
+    let rowProductCols = [];
+    for (const colIdx of productColumnIndices) {
+      if (row[colIdx] !== undefined && row[colIdx] !== null && row[colIdx] !== '') {
+        const val = parseOCRNumber(row[colIdx]);
+        if (val > 0) {
+          rowProductCols.push(colIdx);
+        }
+      }
+    }
+
+    if (rowProductCols.length === 0) continue;
+
+    const minColIdx = Math.min(...rowProductCols);
+    if (minColIdx <= lastColIndex) {
+      slots.push(currentSlot);
+      currentSlot = [];
+    }
+
+    currentSlot.push({ rowIndex, row, rowProductCols });
+    lastColIndex = Math.max(...rowProductCols);
+  }
+
+  if (currentSlot.length > 0) {
+    slots.push(currentSlot);
+  }
+
+  console.log(`[LAOS] Total logical slots found for Khon Kaen: ${slots.length}`);
+  slots.forEach((s, idx) => {
+    console.log(`  Slot ${idx + 1}:`);
+    s.forEach(e => {
+      const productVals = productColumnIndices.map(col => `${col}: "${e.row[col] || ''}"`).join(', ');
+      console.log(`    Row ${e.rowIndex}: [${productVals}]`);
+    });
+  });
+
+  // If there are exactly 3 slots, the last one is Laos
+  if (slots.length === 3) {
+    const laosSlot = slots[2];
+    for (const entry of laosSlot) {
+      if (entry.row[columnIndex]) {
+        const val = parseOCRNumber(entry.row[columnIndex]);
+        if (val > 0) {
+          return val;
+        }
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -740,7 +808,8 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
     }
 
     // Extract Khon Kaen Laos for orange
-    const khonKaenLaosValue = category === 'orange' ? extractKhonKaenLaos(table, columnIndex) : 0;
+    const productColumnIndices = Object.values(detectedProducts).map(p => p.column).sort((a, b) => a - b);
+    const khonKaenLaosValue = category === 'orange' ? extractKhonKaenLaos(table, columnIndex, productColumnIndices) : 0;
 
     // Build record
     const dailyRecord = {
@@ -1095,6 +1164,22 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
       recordResult = await recordDailyData(tableData, extractedText, result);
       if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
+
+        // Save the valid image to 'stored_images' folder on the server
+        try {
+          const imagesDir = path.join(__dirname, 'stored_images');
+          await fs.mkdir(imagesDir, { recursive: true });
+
+          // recordResult.date is "DD/MM/YYYY" format
+          const formattedDate = recordResult.date.replace(/\//g, '-');
+          const fileName = `${formattedDate}.jpg`;
+          const filePath = path.join(imagesDir, fileName);
+          await fs.writeFile(filePath, imageBuffer);
+          console.log(`[IMAGE] Saved successful screenshot to ${filePath}`);
+        } catch (imgError) {
+          console.error('[IMAGE] Error saving successful screenshot:', imgError);
+        }
+
         // Log successful extraction
         await saveDetectionLog({
           timestamp: new Date().toISOString(),

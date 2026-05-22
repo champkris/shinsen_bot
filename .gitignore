@@ -9,3 +9,5 @@ debug.log
 # Runtime data files
 daily_records.json
 detection_logs.json
+stored_images/
+

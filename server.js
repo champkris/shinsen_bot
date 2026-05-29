@@ -205,6 +205,43 @@ function parseOCRNumber(str) {
   return parseFloat(s) || 0;
 }
 
+// Get product value from a row, with fallback to crate-based reconstruction if the value is misread (non-numeric)
+function getRowProductValue(row, columnIndex, rowIndex = -1) {
+  if (!row || !row[columnIndex]) return 0;
+
+  const rawValText = row[columnIndex].toString().trim();
+  if (!rawValText || rawValText === '0') return 0;
+
+  let value = parseOCRNumber(rawValText);
+
+  // If value is 0 (failed to parse or non-numeric), check if we can reconstruct from crates columns
+  if (value === 0) {
+    const fullCrates = row[5] ? parseOCRNumber(row[5]) : 0;
+    const partialBottles = row[6] ? parseOCRNumber(row[6]) : 0;
+    const reconstructed = (fullCrates * 35) + partialBottles;
+
+    if (reconstructed > 0) {
+      // Check if this column is the active product column in this row (to avoid double-counting other products)
+      let isOtherProductNonEmpty = false;
+      for (let c = 2; c < 5; c++) {
+        if (c === columnIndex) continue;
+        const otherVal = row[c] ? row[c].toString().trim() : '';
+        if (otherVal !== '' && otherVal !== '0') {
+          isOtherProductNonEmpty = true;
+          break;
+        }
+      }
+
+      if (!isOtherProductNonEmpty) {
+        console.log(`[OCR-FIX] Row ${rowIndex}: Reconstructed value using crates: ${reconstructed} (Full: ${fullCrates}, Partial: ${partialBottles}) because original was "${rawValText}"`);
+        value = reconstructed;
+      }
+    }
+  }
+
+  return value;
+}
+
 // CDC names to track
 const CDC_NAMES = [
   'บางบัวทอง',
@@ -519,7 +556,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
       if (i === totalsRowIndex) continue;
       const row = table[i];
       if (!row || !row[columnIndex]) continue;
-      const value = parseOCRNumber(row[columnIndex]);
+      const value = getRowProductValue(row, columnIndex, i);
       if (value > 0) totalSum += value;
     }
   }
@@ -553,7 +590,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
     if (!bestCdcName) return;
 
     const fullCdcName = CDC_NAME_MAPPING[bestCdcName];
-    const value = parseOCRNumber(row[columnIndex]);
+    const value = getRowProductValue(row, columnIndex, rowIndex);
     const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
     if (value > 0) {
       cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
@@ -1288,7 +1325,7 @@ function transformTableData(tableData, columnIndex = 2) {
   // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
   // Using C0 (with the FC code) avoids double-counting when C1 fill-down carries
   // a previous vendor's warehouse into a later row.
-  table.forEach((row) => {
+  table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
     if (!row[columnIndex]) return;
 
@@ -1305,7 +1342,7 @@ function transformTableData(tableData, columnIndex = 2) {
     }
     if (!bestCdcName) return;
 
-    const value = parseOCRNumber(row[columnIndex]);
+    const value = getRowProductValue(row, columnIndex, rowIndex);
     if (value > 0) {
       cdcTotals[cdcNameMapping[bestCdcName]] += value;
     }

@@ -192,15 +192,8 @@ function parseOCRNumber(str) {
   // Remove whitespace and newlines
   s = s.replace(/[\s]/g, '');
 
-  // Check if period is used as thousand separator (e.g., "1.331" should be 1331)
-  // Pattern: digit(s), period, exactly 3 digits, end of string
-  if (/^\d+\.\d{3}$/.test(s)) {
-    // Period is thousand separator, remove it
-    s = s.replace(/\./g, '');
-  }
-
-  // Remove commas (thousand separators)
-  s = s.replace(/,/g, '');
+  // Remove periods and commas (they are always misread thousand separators, noise, or formatting)
+  s = s.replace(/[\.,]/g, '');
 
   return parseFloat(s) || 0;
 }

@@ -210,7 +210,7 @@ function getRowProductValue(row, columnIndex, rowIndex = -1) {
   if (!row || !row[columnIndex]) return 0;
 
   const rawValText = row[columnIndex].toString().trim();
-  if (!rawValText || rawValText === '0') return 0;
+  if (!rawValText) return 0;
 
   let value = parseOCRNumber(rawValText);
 
@@ -423,7 +423,7 @@ function validateTableData(table, detectedProducts) {
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
       const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
-      const value = parseOCRNumber(rawCell);
+      const value = getRowProductValue(row, colIdx, rowIndex);
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
         hadyaiSum += value;

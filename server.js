@@ -1239,8 +1239,7 @@ async function detectExcelScreenshot(imageBuffer) {
 }
 
 async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null) {
-  if (!gemini) {
-    console.log('[GEMINI] Gemini client not configured, falling back to Azure Document Intelligence OCR.');
+  const runAzureOCR = async () => {
     try {
       console.log('Starting Azure OCR...');
 
@@ -1381,6 +1380,11 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
       console.error('Error in OCR:', error);
       throw error;
     }
+  };
+
+  if (!gemini) {
+    console.log('[GEMINI] Gemini client not configured, falling back to Azure Document Intelligence OCR.');
+    return await runAzureOCR();
   }
 
   // Gemini OCR flow
@@ -1551,8 +1555,13 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
 
     return { extractedText, recordResult };
   } catch (error) {
-    console.error('Error in Gemini performOCR:', error);
-    throw error;
+    console.error('[GEMINI] Runtime error in Gemini performOCR. Falling back to Azure Document Intelligence OCR:', error);
+    try {
+      return await runAzureOCR();
+    } catch (fallbackError) {
+      console.error('Error in fallback Azure OCR:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 

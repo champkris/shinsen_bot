@@ -1165,7 +1165,10 @@ async function detectExcelScreenshot(imageBuffer) {
           }
         },
         'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.'
-      ]
+      ],
+      config: {
+        temperature: 0.0
+      }
     }));
 
     const answer = response.text.trim().toUpperCase();
@@ -1194,6 +1197,22 @@ Please analyze the image:
 2. Extract the entire table structure as a 2D array of strings (rows and columns). Preserve the layout. Empty or blank cells should be represented as empty strings (""). If cells are merged, fill the content in the top-left cell and leave others empty. Do not skip any rows or columns.
 3. Identify the "ยอดรวม" (grand total) or "รวม" row in the table. For each column containing product bottle counts (typically columns C2, C3, C4, etc.), extract the column index (0-indexed) and its corresponding total value from the grand total row, and populate the "yodruam_totals" array.
 
+CRITICAL INSTRUCTION FOR COLUMN HEADERS:
+The column headers in this spreadsheet are written vertically in small cells, which makes them hard to read. They contain specific Thai words and units. Please transcribe them carefully to match the text in the image. The expected column headers are:
+- 'จำนวน น้ำ ส้ม (ขวด)'
+- 'จำนวน น้ำ ส้มมุกป๊อป (ขวด)' or 'จำนวน น้ำ มุกป๊อป (ขวด)'
+- 'จำนวน น้ำ สับปะรด (ขวด)'
+- 'จำนวน น้ำ ยูซุ (ขวด)'
+- 'จำนวน ตะกร้า เต็ม (ใบ)'
+- 'จำนวน ตะกร้า เศษ (ขวด)'
+- 'จำนวน ตะกร้า รวม (ใบ)'
+- 'จำนวน รถ (คัน)'
+- 'รายชื่อ ผู้ส่ง สินค้า'
+- 'เวลา โหลด สินค้า'
+- 'เวลา จัดส่ง สินค้า'
+
+Please map the vertically written text in the header cells to these exact phrases.
+
 Make sure you read all numbers and Thai characters (e.g., CDC names like 'บางบัวทอง', 'นครราชสีมา', 'ภูเก็ต', 'หาดใหญ่') extremely accurately.`;
 
     const response = await callGeminiWithRetry(() => gemini.models.generateContent({
@@ -1208,6 +1227,7 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
         prompt
       ],
       config: {
+        temperature: 0.0,
         responseMimeType: 'application/json',
         responseSchema: {
           type: 'OBJECT',

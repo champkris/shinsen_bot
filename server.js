@@ -28,6 +28,8 @@ const blobClient = new line.messagingApi.MessagingApiBlobClient({
   channelAccessToken: config.channelAccessToken,
 });
 
+const { GoogleGenAI } = require('@google/genai');
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -36,6 +38,42 @@ const azureClient = new DocumentAnalysisClient(
   process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT,
   new AzureKeyCredential(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY)
 );
+
+// Initialize Gemini Client
+const geminiApiKey = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+let gemini = null;
+
+if (geminiApiKey) {
+  gemini = new GoogleGenAI({ apiKey: geminiApiKey });
+  console.log(`[CONFIG] Google Gen AI (Gemini) client initialized successfully. Model: ${GEMINI_MODEL}`);
+} else {
+  console.warn('[CONFIG] WARNING: GEMINI_API_KEY is not configured in .env. Gemini OCR will fail until key is set.');
+}
+
+// Helper function to call Gemini API with retry logic for 429 Rate Limits
+async function callGeminiWithRetry(apiCallFn, retries = 5, delayMs = 4000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await apiCallFn();
+    } catch (error) {
+      const isRateLimit = error.status === 429 || 
+                          error.statusCode === 429 ||
+                          error.message?.includes('429') || 
+                          error.message?.toLowerCase().includes('rate limit');
+      if (isRateLimit && attempt < retries) {
+        // Add random jitter between 0 and 1500ms
+        const jitter = Math.random() * 1500;
+        const totalDelay = delayMs + jitter;
+        console.warn(`[GEMINI-RETRY] Rate limit hit (429). Retrying attempt ${attempt}/${retries} in ${totalDelay.toFixed(0)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, totalDelay));
+        delayMs *= 2; // exponential backoff
+        continue;
+      }
+      throw error;
+    }
+  }
+}
 
 let latestOCRResult = {
   timestamp: null,
@@ -749,7 +787,11 @@ function extractKhonKaenLaos(table, columnIndex, productColumnIndices) {
 // Extract ยอดรวม (totals) from raw OCR page text, mapped to table column indices
 // The ยอดรวม row is often outside the table structure but always present in raw text
 function extractYodruamTotals(rawResult) {
-  if (!rawResult || !rawResult.pages) return {};
+  if (!rawResult) return {};
+  if (rawResult.yodruamTotals) {
+    return rawResult.yodruamTotals;
+  }
+  if (!rawResult.pages) return {};
 
   for (const page of rawResult.pages) {
     if (!page.lines) continue;
@@ -1104,123 +1146,355 @@ async function getImageContent(messageId) {
 }
 
 async function detectExcelScreenshot(imageBuffer) {
+  if (!gemini) {
+    console.log('[GEMINI] Gemini client not configured, falling back to OpenAI GPT-4o for Excel detection.');
+    try {
+      const base64Image = imageBuffer.toString('base64');
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        max_tokens: 100,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`,
+                },
+              },
+              {
+                type: 'text',
+                text: 'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.',
+              },
+            ],
+          },
+        ],
+      });
+      const answer = response.choices[0].message.content.trim().toUpperCase();
+      console.log('GPT-4 Vision response:', answer);
+      return answer === 'YES';
+    } catch (error) {
+      console.error('Error in OpenAI Excel detection:', error);
+      throw error;
+    }
+  }
+
   try {
     const base64Image = imageBuffer.toString('base64');
+    console.log('[GEMINI] Detecting Excel screenshot using Gemini...');
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 100,
-      messages: [
+    const response = await callGeminiWithRetry(() => gemini.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: [
         {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Image}`,
-              },
-            },
-            {
-              type: 'text',
-              text: 'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.',
-            },
-          ],
+          inlineData: {
+            data: base64Image,
+            mimeType: 'image/jpeg'
+          }
         },
-      ],
-    });
+        'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.'
+      ]
+    }));
 
-    const answer = response.choices[0].message.content.trim().toUpperCase();
-    console.log('GPT-4 Vision response:', answer);
-
-    return answer === 'YES';
+    const answer = response.text.trim().toUpperCase();
+    console.log('Gemini Vision response:', answer);
+    return answer.includes('YES');
   } catch (error) {
-    console.error('Error in Excel detection:', error);
-    throw error;
+    console.error('Error in Gemini Excel detection:', error);
+    // Fallback to OpenAI if Gemini fails for some reason
+    console.log('[GEMINI] Falling back to OpenAI due to Gemini error.');
+    try {
+      const base64Image = imageBuffer.toString('base64');
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        max_tokens: 100,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`,
+                },
+              },
+              {
+                type: 'text',
+                text: 'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.',
+              },
+            ],
+          },
+        ],
+      });
+      const answer = response.choices[0].message.content.trim().toUpperCase();
+      console.log('GPT-4 Vision fallback response:', answer);
+      return answer === 'YES';
+    } catch (fallbackError) {
+      console.error('Error in OpenAI fallback Excel detection:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 
 async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null) {
-  try {
-    console.log('Starting Azure OCR...');
+  if (!gemini) {
+    console.log('[GEMINI] Gemini client not configured, falling back to Azure Document Intelligence OCR.');
+    try {
+      console.log('Starting Azure OCR...');
 
-    const poller = await azureClient.beginAnalyzeDocument('prebuilt-layout', imageBuffer);
-    const result = await poller.pollUntilDone();
+      const poller = await azureClient.beginAnalyzeDocument('prebuilt-layout', imageBuffer);
+      const result = await poller.pollUntilDone();
 
-    let extractedText = '';
-    let tableData = [];
+      let extractedText = '';
+      let tableData = [];
 
-    if (result.pages) {
-      for (const page of result.pages) {
-        if (page.lines) {
-          for (const line of page.lines) {
-            extractedText += line.content + '\n';
-          }
-        }
-      }
-    }
-
-    if (result.tables) {
-      for (const table of result.tables) {
-        const tableRows = [];
-        const maxRow = Math.max(...table.cells.map(c => c.rowIndex)) + 1;
-        const maxCol = Math.max(...table.cells.map(c => c.columnIndex)) + 1;
-
-        for (let i = 0; i < maxRow; i++) {
-          tableRows[i] = new Array(maxCol).fill('');
-        }
-
-        for (const cell of table.cells) {
-          const content = cell.content || '';
-          const rowIdx = cell.rowIndex;
-          const colIdx = cell.columnIndex;
-          const rowSpan = cell.rowSpan || 1;
-
-          // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
-          // a single multi-row cell. Split the content by FC code so fill-down later
-          // gives each row exactly one vendor instead of leaving both names in every row.
-          if (colIdx === 0 && rowSpan > 1) {
-            const fcParts = content
-              .split(/(?=FC\d+)/)
-              .map(p => p.trim())
-              .filter(p => /^FC\d+/.test(p));
-            if (fcParts.length > 1) {
-              const K = fcParts.length;
-              for (let i = 0; i < rowSpan; i++) {
-                const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
-                tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
-              }
-              console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
-              continue;
+      if (result.pages) {
+        for (const page of result.pages) {
+          if (page.lines) {
+            for (const line of page.lines) {
+              extractedText += line.content + '\n';
             }
           }
-
-          tableRows[rowIdx][colIdx] = content;
         }
-
-        tableData.push(tableRows);
       }
+
+      if (result.tables) {
+        for (const table of result.tables) {
+          const tableRows = [];
+          const maxRow = Math.max(...table.cells.map(c => c.rowIndex)) + 1;
+          const maxCol = Math.max(...table.cells.map(c => c.columnIndex)) + 1;
+
+          for (let i = 0; i < maxRow; i++) {
+            tableRows[i] = new Array(maxCol).fill('');
+          }
+
+          for (const cell of table.cells) {
+            const content = cell.content || '';
+            const rowIdx = cell.rowIndex;
+            const colIdx = cell.columnIndex;
+            const rowSpan = cell.rowSpan || 1;
+
+            // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
+            // a single multi-row cell. Split the content by FC code so fill-down later
+            // gives each row exactly one vendor instead of leaving both names in every row.
+            if (colIdx === 0 && rowSpan > 1) {
+              const fcParts = content
+                .split(/(?=FC\d+)/)
+                .map(p => p.trim())
+                .filter(p => /^FC\d+/.test(p));
+              if (fcParts.length > 1) {
+                const K = fcParts.length;
+                for (let i = 0; i < rowSpan; i++) {
+                  const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
+                  tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
+                }
+                console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
+                continue;
+              }
+            }
+
+            tableRows[rowIdx][colIdx] = content;
+          }
+
+          tableData.push(tableRows);
+        }
+      }
+
+      // Preprocess table data: fill down C0 and C1 to help with extraction
+      if (tableData && tableData.length > 0) {
+        tableData = preprocessTableData(tableData);
+      }
+
+      latestOCRResult = {
+        timestamp: new Date(),
+        extractedText: extractedText,
+        tableData: tableData,
+        rawResult: result,
+        messageId: messageId
+      };
+
+      console.log('OCR completed. Text length:', extractedText.length);
+      console.log('Tables found:', tableData.length);
+
+      // Record daily data if conditions are met
+      let recordResult = null;
+      try {
+        recordResult = await recordDailyData(tableData, extractedText, result);
+        if (recordResult && recordResult.success) {
+          console.log('Daily data recorded successfully');
+
+          // Save the valid image to 'stored_images' folder on the server
+          try {
+            const imagesDir = path.join(__dirname, 'stored_images');
+            await fs.mkdir(imagesDir, { recursive: true });
+
+            // recordResult.date is "DD/MM/YYYY" format
+            const formattedDate = recordResult.date.replace(/\//g, '-');
+            const fileName = `${formattedDate}.jpg`;
+            const filePath = path.join(imagesDir, fileName);
+            await fs.writeFile(filePath, imageBuffer);
+            console.log(`[IMAGE] Saved successful screenshot to ${filePath}`);
+          } catch (imgError) {
+            console.error('[IMAGE] Error saving successful screenshot:', imgError);
+          }
+
+          // Log successful extraction
+          await saveDetectionLog({
+            timestamp: new Date().toISOString(),
+            messageId: latestOCRResult.messageId || 'unknown',
+            groupId: sourceInfo?.groupId || null,
+            userId: sourceInfo?.userId || null,
+            status: 'success',
+            date: recordResult.date,
+            categories: recordResult.results.map(r => r.category),
+            recordsCreated: recordResult.results.length
+          });
+        } else if (recordResult && !recordResult.success) {
+          console.log('Daily data not recorded:', recordResult.reason);
+          // Log failed extraction with reason
+          await saveDetectionLog({
+            timestamp: new Date().toISOString(),
+            messageId: latestOCRResult.messageId || 'unknown',
+            groupId: sourceInfo?.groupId || null,
+            userId: sourceInfo?.userId || null,
+            status: 'failed',
+            reason: recordResult.reason
+          });
+        }
+      } catch (error) {
+        console.error('Error recording daily data:', error);
+        // Log error
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: latestOCRResult.messageId || 'unknown',
+          groupId: sourceInfo?.groupId || null,
+          userId: sourceInfo?.userId || null,
+          status: 'error',
+          reason: `Error: ${error.message}`
+        });
+      }
+
+      return { extractedText, recordResult };
+    } catch (error) {
+      console.error('Error in OCR:', error);
+      throw error;
+    }
+  }
+
+  // Gemini OCR flow
+  try {
+    console.log('[GEMINI] Starting Gemini Table Extraction OCR...');
+    const base64Image = imageBuffer.toString('base64');
+
+    const prompt = `You are an expert OCR and table extraction agent. Your job is to extract tabular sales/dispatch records from the provided spreadsheet image.
+
+Please analyze the image:
+1. Verify if it is a spreadsheet screenshot containing daily sales/dispatch records. Set is_excel_screenshot accordingly.
+2. Extract the entire table structure as a 2D array of strings (rows and columns). Preserve the layout. Empty or blank cells should be represented as empty strings (""). If cells are merged, fill the content in the top-left cell and leave others empty. Do not skip any rows or columns.
+3. Identify the "ยอดรวม" (grand total) or "รวม" row in the table. For each column containing product bottle counts (typically columns C2, C3, C4, etc.), extract the column index (0-indexed) and its corresponding total value from the grand total row, and populate the "yodruam_totals" array.
+
+Make sure you read all numbers and Thai characters (e.g., CDC names like 'บางบัวทอง', 'นครราชสีมา', 'ภูเก็ต', 'หาดใหญ่') extremely accurately.`;
+
+    const response = await callGeminiWithRetry(() => gemini.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: [
+        {
+          inlineData: {
+            data: base64Image,
+            mimeType: 'image/jpeg'
+          }
+        },
+        prompt
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            is_excel_screenshot: {
+              type: 'BOOLEAN',
+              description: 'Whether the image contains an Excel/spreadsheet style table grid with daily sales/dispatch records.'
+            },
+            table: {
+              type: 'ARRAY',
+              items: {
+                type: 'ARRAY',
+                items: {
+                  type: 'STRING'
+                }
+              },
+              description: 'The extracted table as a 2D array of strings. Each sub-array represents a row.'
+            },
+            yodruam_totals: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  column_index: { type: 'INTEGER', description: '0-indexed column position of the product quantity.' },
+                  total_value: { type: 'INTEGER', description: 'The grand total quantity value for this column.' }
+                },
+                required: ['column_index', 'total_value']
+              },
+              description: 'Extracted total values from the "ยอดรวม" (grand total) row mapped to their column index.'
+            }
+          },
+          required: ['is_excel_screenshot', 'table']
+        }
+      }
+    }));
+
+    const resultJson = JSON.parse(response.text);
+    console.log('[GEMINI] Extracted JSON structure successfully.');
+
+    if (!resultJson.is_excel_screenshot) {
+      console.log('[GEMINI] Gemini determined this image is not a valid Excel screenshot.');
+      const recordResult = { success: false, reason: 'Not detected as a valid Excel screenshot by Gemini' };
+      
+      await saveDetectionLog({
+        timestamp: new Date().toISOString(),
+        messageId: messageId,
+        groupId: sourceInfo?.groupId || null,
+        userId: sourceInfo?.userId || null,
+        status: 'failed',
+        reason: recordResult.reason
+      });
+
+      return { extractedText: '', recordResult };
     }
 
-    // Preprocess table data: fill down C0 and C1 to help with extraction
+    let tableData = [resultJson.table];
+    let extractedText = resultJson.table.map(row => row.join('\t')).join('\n');
+
+    console.log('[GEMINI] Table extracted rows:', resultJson.table.length);
+    console.log('[GEMINI] Headers:', resultJson.table[0] ? resultJson.table[0].slice(0, 5).join(' | ') : 'None');
+
     if (tableData && tableData.length > 0) {
       tableData = preprocessTableData(tableData);
+    }
+
+    // Construct mock rawResult matching what extractYodruamTotals expects
+    const rawResult = {
+      yodruamTotals: {}
+    };
+    if (resultJson.yodruam_totals) {
+      resultJson.yodruam_totals.forEach(item => {
+        rawResult.yodruamTotals[item.column_index] = item.total_value;
+      });
+      console.log('[GEMINI] Extracted Yodruam Totals:', rawResult.yodruamTotals);
     }
 
     latestOCRResult = {
       timestamp: new Date(),
       extractedText: extractedText,
       tableData: tableData,
-      rawResult: result,
+      rawResult: rawResult,
       messageId: messageId
     };
 
-    console.log('OCR completed. Text length:', extractedText.length);
-    console.log('Tables found:', tableData.length);
-
-    // Record daily data if conditions are met
     let recordResult = null;
     try {
-      recordResult = await recordDailyData(tableData, extractedText, result);
+      recordResult = await recordDailyData(tableData, extractedText, rawResult);
       if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
 
@@ -1229,7 +1503,6 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
           const imagesDir = path.join(__dirname, 'stored_images');
           await fs.mkdir(imagesDir, { recursive: true });
 
-          // recordResult.date is "DD/MM/YYYY" format
           const formattedDate = recordResult.date.replace(/\//g, '-');
           const fileName = `${formattedDate}.jpg`;
           const filePath = path.join(imagesDir, fileName);
@@ -1277,7 +1550,7 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
 
     return { extractedText, recordResult };
   } catch (error) {
-    console.error('Error in OCR:', error);
+    console.error('Error in Gemini performOCR:', error);
     throw error;
   }
 }
@@ -2144,7 +2417,7 @@ app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (re
 
     if (isExcelScreenshot) {
       console.log('[TEST-OCR] Performing OCR...');
-      const extractedText = await performOCR(imageBuffer);
+      const { extractedText } = await performOCR(imageBuffer);
 
       res.json({
         success: true,

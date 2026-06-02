@@ -199,21 +199,17 @@ function parseOCRNumber(str) {
 }
 
 // Get product value from a row, with fallback to crate-based reconstruction if the value is misread (non-numeric)
-function getRowProductValue(row, columnIndex, rowIndex = -1) {
-  if (!row || !row[columnIndex]) return 0;
+function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, totalsRowIndex = -1, yodruamTotal = 0) {
+  if (!row) return 0;
 
-  const rawValText = row[columnIndex].toString().trim();
-  if (!rawValText) return 0;
+  const rawValText = row[columnIndex] ? row[columnIndex].toString().trim() : '';
+  const fullCrates = row[5] ? parseOCRNumber(row[5]) : 0;
+  const partialBottles = row[6] ? parseOCRNumber(row[6]) : 0;
+  const reconstructed = (fullCrates * 35) + partialBottles;
 
-  let value = parseOCRNumber(rawValText);
-
-  // If value is 0 (failed to parse or non-numeric), check if we can reconstruct from crates columns
-  if (value === 0) {
-    const fullCrates = row[5] ? parseOCRNumber(row[5]) : 0;
-    const partialBottles = row[6] ? parseOCRNumber(row[6]) : 0;
-    const reconstructed = (fullCrates * 35) + partialBottles;
-
-    if (reconstructed > 0) {
+  if (rawValText !== '') {
+    let value = parseOCRNumber(rawValText);
+    if (value === 0 && reconstructed > 0) {
       // Check if this column is the active product column in this row (to avoid double-counting other products)
       let isOtherProductNonEmpty = false;
       for (let c = 2; c < 5; c++) {
@@ -230,9 +226,43 @@ function getRowProductValue(row, columnIndex, rowIndex = -1) {
         value = reconstructed;
       }
     }
+    return value;
   }
 
-  return value;
+  // If the cell is completely empty, check if we can infer it using grand total difference
+  if (reconstructed > 0 && table && totalsRowIndex !== -1 && yodruamTotal > 0) {
+    // Check if other product columns in this row are empty/0
+    let isOtherProductNonEmpty = false;
+    for (let c = 2; c < 5; c++) {
+      if (c === columnIndex) continue;
+      const otherVal = row[c] ? row[c].toString().trim() : '';
+      if (otherVal !== '' && otherVal !== '0') {
+        isOtherProductNonEmpty = true;
+        break;
+      }
+    }
+
+    if (!isOtherProductNonEmpty) {
+      // Calculate sum of all other rows (excluding this row and totals row)
+      let sumOfOtherRows = 0;
+      for (let i = 0; i < table.length; i++) {
+        if (i === totalsRowIndex || i === rowIndex || !table[i]) continue;
+        const rValText = table[i][columnIndex] ? table[i][columnIndex].toString().trim() : '';
+        if (rValText !== '') {
+          // Pass null for table to prevent infinite recursion
+          sumOfOtherRows += getRowProductValue(table[i], columnIndex, i);
+        }
+      }
+
+      const diff = yodruamTotal - sumOfOtherRows;
+      if (diff === reconstructed) {
+        console.log(`[OCR-FIX] Row ${rowIndex}: Assigned empty cell to col ${columnIndex} because grand total diff (${diff}) matches reconstructed value (${reconstructed})`);
+        return reconstructed;
+      }
+    }
+  }
+
+  return 0;
 }
 
 // CDC names to track
@@ -563,7 +593,6 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
     if (rowIndex === totalsRowIndex) return;
-    if (!row[columnIndex]) return;
 
     // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
     // C1 (source warehouse) is unreliable: fill-down can carry a previous vendor's
@@ -583,7 +612,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
     if (!bestCdcName) return;
 
     const fullCdcName = CDC_NAME_MAPPING[bestCdcName];
-    const value = getRowProductValue(row, columnIndex, rowIndex);
+    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamTotal);
     const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
     if (value > 0) {
       cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
@@ -1318,9 +1347,32 @@ function transformTableData(tableData, columnIndex = 2) {
   // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
   // Using C0 (with the FC code) avoids double-counting when C1 fill-down carries
   // a previous vendor's warehouse into a later row.
+  let totalsRowIndex = -1;
+  for (let i = 0; i < table.length; i++) {
+    const row = table[i];
+    if (!row || row.length < 2) continue;
+    const c0 = row[0] ? row[0].toString().trim() : '';
+    const totalIndicators = ['ยอดรวม', 'รวม', 'total', 'grand total', 'sum'];
+    const foundTotal = totalIndicators.some(indicator =>
+      c0.toLowerCase().includes(indicator.toLowerCase())
+    );
+    if (foundTotal) {
+      totalsRowIndex = i;
+      break;
+    }
+  }
+
+  let yodruamValue = 0;
+  if (totalsRowIndex !== -1 && table[totalsRowIndex][columnIndex]) {
+    yodruamValue = parseOCRNumber(table[totalsRowIndex][columnIndex]);
+  }
+
+  // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
+  // Using C0 (with the FC code) avoids double-counting when C1 fill-down carries
+  // a previous vendor's warehouse into a later row.
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
-    if (!row[columnIndex]) return;
+    if (rowIndex === totalsRowIndex) return;
 
     const c0 = row[0] ? row[0].toString() : '';
     if (!c0) return;
@@ -1335,7 +1387,7 @@ function transformTableData(tableData, columnIndex = 2) {
     }
     if (!bestCdcName) return;
 
-    const value = getRowProductValue(row, columnIndex, rowIndex);
+    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamValue);
     if (value > 0) {
       cdcTotals[cdcNameMapping[bestCdcName]] += value;
     }

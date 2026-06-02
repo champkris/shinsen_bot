@@ -51,21 +51,26 @@ if (geminiApiKey) {
   console.warn('[CONFIG] WARNING: GEMINI_API_KEY is not configured in .env. Gemini OCR will fail until key is set.');
 }
 
-// Helper function to call Gemini API with retry logic for 429 Rate Limits
+// Helper function to call Gemini API with retry logic for 429 Rate Limits and 503 Overloads
 async function callGeminiWithRetry(apiCallFn, retries = 5, delayMs = 4000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await apiCallFn();
     } catch (error) {
-      const isRateLimit = error.status === 429 || 
+      const isTransient = error.status === 429 || 
                           error.statusCode === 429 ||
+                          error.status === 503 ||
+                          error.statusCode === 503 ||
                           error.message?.includes('429') || 
-                          error.message?.toLowerCase().includes('rate limit');
-      if (isRateLimit && attempt < retries) {
+                          error.message?.includes('503') ||
+                          error.message?.toLowerCase().includes('rate limit') ||
+                          error.message?.toLowerCase().includes('unavailable') ||
+                          error.message?.toLowerCase().includes('overloaded');
+      if (isTransient && attempt < retries) {
         // Add random jitter between 0 and 1500ms
         const jitter = Math.random() * 1500;
         const totalDelay = delayMs + jitter;
-        console.warn(`[GEMINI-RETRY] Rate limit hit (429). Retrying attempt ${attempt}/${retries} in ${totalDelay.toFixed(0)}ms...`);
+        console.warn(`[GEMINI-RETRY] Transient error hit (${error.status || error.statusCode || '503/429'}). Retrying attempt ${attempt}/${retries} in ${totalDelay.toFixed(0)}ms...`);
         await new Promise(resolve => setTimeout(resolve, totalDelay));
         delayMs *= 2; // exponential backoff
         continue;

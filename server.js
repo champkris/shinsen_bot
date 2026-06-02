@@ -484,17 +484,19 @@ function validateTableData(table, detectedProducts) {
     if (!row || row.length < 3) return;
 
     const c0Cell = row[0] ? row[0].toString().trim() : '';
-    const isVendorRow = /FC\d+/.test(c0Cell);
+    const c2Cell = row[2] ? row[2].toString().trim() : '';
+    const combinedC = `${c0Cell} ${c2Cell}`.trim();
+    const isVendorRow = /FC\d+/.test(combinedC);
 
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
       const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
       const value = getRowProductValue(row, colIdx, rowIndex);
 
-      if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
+      if (combinedC.includes('FC33') && combinedC.includes('หาดใหญ่')) {
         hadyaiSum += value;
       }
-      if (c0Cell.includes('FC07')) {
+      if (combinedC.includes('FC07')) {
         phuketSum += value;
       }
 
@@ -637,17 +639,19 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
     if (!row || row.length < 2) return;
     if (rowIndex === totalsRowIndex) return;
 
-    // Each row maps to exactly one CDC, derived from the Vendor cell (C0).
+    // Each row maps to exactly one CDC, derived from the Vendor cell (C0) or shifted column (C2).
     // C1 (source warehouse) is unreliable: fill-down can carry a previous vendor's
     // warehouse name into the next vendor's first row, and a single row's value
     // ends up double-counted across two CDCs.
     const c0 = row[0] ? row[0].toString() : '';
-    if (!c0) return;
+    const c2 = row[2] ? row[2].toString() : '';
+    const combinedC = `${c0} ${c2}`.trim();
+    if (!combinedC) return;
 
     let bestCdcName = null;
     let bestScore = 0;
     for (const cdcName of CDC_NAMES) {
-      if (c0.includes(cdcName) && cdcName.length > bestScore) {
+      if (combinedC.includes(cdcName) && cdcName.length > bestScore) {
         bestCdcName = cdcName;
         bestScore = cdcName.length;
       }
@@ -710,12 +714,15 @@ function extractKhonKaenLaos(table, columnIndex, productColumnIndices) {
   // 1. Search for a row that explicitly contains both 'ขอนแก่น' and 'ลาว'/'laos'
   for (let i = 0; i < table.length; i++) {
     const row = table[i];
-    if (!row || !row[0]) continue;
+    if (!row) continue;
 
-    const c0 = row[0].toString().toLowerCase().trim();
-    if (c0.includes('ขอนแก่น') && (c0.includes('ลาว') || c0.includes('laos') || c0.includes('lao')) && row[columnIndex]) {
+    const c0 = row[0] ? row[0].toString() : '';
+    const c2 = row[2] ? row[2].toString() : '';
+    const combinedC = `${c0} ${c2}`.toLowerCase().trim();
+
+    if (combinedC.includes('ขอนแก่น') && (combinedC.includes('ลาว') || combinedC.includes('laos') || combinedC.includes('lao')) && row[columnIndex]) {
       const value = parseOCRNumber(row[columnIndex]);
-      console.log(`[LAOS] Found explicit ขอนแก่น Laos row at index ${i}: "${row[0]}" with value ${value}`);
+      console.log(`[LAOS] Found explicit ขอนแก่น Laos row at index ${i}: "${combinedC}" with value ${value}`);
       return value;
     }
   }
@@ -723,9 +730,11 @@ function extractKhonKaenLaos(table, columnIndex, productColumnIndices) {
   // 2. Group Khon Kaen rows into logical slots
   const khonKaenRows = [];
   table.forEach((row, idx) => {
-    if (!row || !row[0]) return;
-    const c0 = row[0].toString().trim();
-    if (c0.includes('ขอนแก่น')) {
+    if (!row) return;
+    const c0 = row[0] ? row[0].toString() : '';
+    const c2 = row[2] ? row[2].toString() : '';
+    const combinedC = `${c0} ${c2}`.trim();
+    if (combinedC.includes('ขอนแก่น')) {
       khonKaenRows.push({ rowIndex: idx, row });
     }
   });
@@ -1472,13 +1481,16 @@ function transformTableData(tableData, columnIndex = 2) {
     if (!row || row.length < 2) return;
     if (rowIndex === totalsRowIndex) return;
 
+    // Use row[0] (c0) and row[2] (c2) to match CDC name. C1 is the source warehouse which can carry filled-down values.
     const c0 = row[0] ? row[0].toString() : '';
-    if (!c0) return;
+    const c2 = row[2] ? row[2].toString() : '';
+    const combinedC = `${c0} ${c2}`.trim();
+    if (!combinedC) return;
 
     let bestCdcName = null;
     let bestScore = 0;
     for (const cdcName of cdcNames) {
-      if (c0.includes(cdcName) && cdcName.length > bestScore) {
+      if (combinedC.includes(cdcName) && cdcName.length > bestScore) {
         bestCdcName = cdcName;
         bestScore = cdcName.length;
       }

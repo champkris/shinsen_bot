@@ -1148,42 +1148,12 @@ async function getImageContent(messageId) {
 
 async function detectExcelScreenshot(imageBuffer) {
   if (!gemini) {
-    console.log('[GEMINI] Gemini client not configured, falling back to OpenAI GPT-4o for Excel detection.');
-    try {
-      const base64Image = imageBuffer.toString('base64');
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        max_tokens: 100,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${base64Image}`,
-                },
-              },
-              {
-                type: 'text',
-                text: 'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.',
-              },
-            ],
-          },
-        ],
-      });
-      const answer = response.choices[0].message.content.trim().toUpperCase();
-      console.log('GPT-4 Vision response:', answer);
-      return answer === 'YES';
-    } catch (error) {
-      console.error('Error in OpenAI Excel detection:', error);
-      throw error;
-    }
+    throw new Error('Gemini client not configured. Cannot perform Excel screenshot detection.');
   }
 
   try {
     const base64Image = imageBuffer.toString('base64');
-    console.log('[GEMINI] Detecting Excel screenshot using Gemini...');
+    console.log('[GEMINI] Detecting Excel screenshot using Gemini (No fallback)...');
 
     const response = await callGeminiWithRetry(() => gemini.models.generateContent({
       model: GEMINI_MODEL,
@@ -1202,194 +1172,19 @@ async function detectExcelScreenshot(imageBuffer) {
     console.log('Gemini Vision response:', answer);
     return answer.includes('YES');
   } catch (error) {
-    console.error('Error in Gemini Excel detection:', error);
-    // Fallback to OpenAI if Gemini fails for some reason
-    console.log('[GEMINI] Falling back to OpenAI due to Gemini error.');
-    try {
-      const base64Image = imageBuffer.toString('base64');
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        max_tokens: 100,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${base64Image}`,
-                },
-              },
-              {
-                type: 'text',
-                text: 'Does this image contain a spreadsheet with a table grid layout? Look for: cells arranged in rows and columns, gridlines, tabular data structure, column/row organization, or any spreadsheet-like table format (including Excel, Google Sheets, printed spreadsheets, or any tabular data displays). Answer with only "YES" if you see a spreadsheet/table grid, or "NO" if you do not.',
-              },
-            ],
-          },
-        ],
-      });
-      const answer = response.choices[0].message.content.trim().toUpperCase();
-      console.log('GPT-4 Vision fallback response:', answer);
-      return answer === 'YES';
-    } catch (fallbackError) {
-      console.error('Error in OpenAI fallback Excel detection:', fallbackError);
-      throw fallbackError;
-    }
+    console.error('Error in Gemini Excel detection (No fallback):', error);
+    throw error;
   }
 }
 
 async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null) {
-  const runAzureOCR = async () => {
-    try {
-      console.log('Starting Azure OCR...');
-
-      const poller = await azureClient.beginAnalyzeDocument('prebuilt-layout', imageBuffer);
-      const result = await poller.pollUntilDone();
-
-      let extractedText = '';
-      let tableData = [];
-
-      if (result.pages) {
-        for (const page of result.pages) {
-          if (page.lines) {
-            for (const line of page.lines) {
-              extractedText += line.content + '\n';
-            }
-          }
-        }
-      }
-
-      if (result.tables) {
-        for (const table of result.tables) {
-          const tableRows = [];
-          const maxRow = Math.max(...table.cells.map(c => c.rowIndex)) + 1;
-          const maxCol = Math.max(...table.cells.map(c => c.columnIndex)) + 1;
-
-          for (let i = 0; i < maxRow; i++) {
-            tableRows[i] = new Array(maxCol).fill('');
-          }
-
-          for (const cell of table.cells) {
-            const content = cell.content || '';
-            const rowIdx = cell.rowIndex;
-            const colIdx = cell.columnIndex;
-            const rowSpan = cell.rowSpan || 1;
-
-            // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
-            // a single multi-row cell. Split the content by FC code so fill-down later
-            // gives each row exactly one vendor instead of leaving both names in every row.
-            if (colIdx === 0 && rowSpan > 1) {
-              const fcParts = content
-                .split(/(?=FC\d+)/)
-                .map(p => p.trim())
-                .filter(p => /^FC\d+/.test(p));
-              if (fcParts.length > 1) {
-                const K = fcParts.length;
-                for (let i = 0; i < rowSpan; i++) {
-                  const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
-                  tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
-                }
-                console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
-                continue;
-              }
-            }
-
-            tableRows[rowIdx][colIdx] = content;
-          }
-
-          tableData.push(tableRows);
-        }
-      }
-
-      // Preprocess table data: fill down C0 and C1 to help with extraction
-      if (tableData && tableData.length > 0) {
-        tableData = preprocessTableData(tableData);
-      }
-
-      latestOCRResult = {
-        timestamp: new Date(),
-        extractedText: extractedText,
-        tableData: tableData,
-        rawResult: result,
-        messageId: messageId
-      };
-
-      console.log('OCR completed. Text length:', extractedText.length);
-      console.log('Tables found:', tableData.length);
-
-      // Record daily data if conditions are met
-      let recordResult = null;
-      try {
-        recordResult = await recordDailyData(tableData, extractedText, result);
-        if (recordResult && recordResult.success) {
-          console.log('Daily data recorded successfully');
-
-          // Save the valid image to 'stored_images' folder on the server
-          try {
-            const imagesDir = path.join(__dirname, 'stored_images');
-            await fs.mkdir(imagesDir, { recursive: true });
-
-            // recordResult.date is "DD/MM/YYYY" format
-            const formattedDate = recordResult.date.replace(/\//g, '-');
-            const fileName = `${formattedDate}.jpg`;
-            const filePath = path.join(imagesDir, fileName);
-            await fs.writeFile(filePath, imageBuffer);
-            console.log(`[IMAGE] Saved successful screenshot to ${filePath}`);
-          } catch (imgError) {
-            console.error('[IMAGE] Error saving successful screenshot:', imgError);
-          }
-
-          // Log successful extraction
-          await saveDetectionLog({
-            timestamp: new Date().toISOString(),
-            messageId: latestOCRResult.messageId || 'unknown',
-            groupId: sourceInfo?.groupId || null,
-            userId: sourceInfo?.userId || null,
-            status: 'success',
-            date: recordResult.date,
-            categories: recordResult.results.map(r => r.category),
-            recordsCreated: recordResult.results.length
-          });
-        } else if (recordResult && !recordResult.success) {
-          console.log('Daily data not recorded:', recordResult.reason);
-          // Log failed extraction with reason
-          await saveDetectionLog({
-            timestamp: new Date().toISOString(),
-            messageId: latestOCRResult.messageId || 'unknown',
-            groupId: sourceInfo?.groupId || null,
-            userId: sourceInfo?.userId || null,
-            status: 'failed',
-            reason: recordResult.reason
-          });
-        }
-      } catch (error) {
-        console.error('Error recording daily data:', error);
-        // Log error
-        await saveDetectionLog({
-          timestamp: new Date().toISOString(),
-          messageId: latestOCRResult.messageId || 'unknown',
-          groupId: sourceInfo?.groupId || null,
-          userId: sourceInfo?.userId || null,
-          status: 'error',
-          reason: `Error: ${error.message}`
-        });
-      }
-
-      return { extractedText, recordResult };
-    } catch (error) {
-      console.error('Error in OCR:', error);
-      throw error;
-    }
-  };
-
   if (!gemini) {
-    console.log('[GEMINI] Gemini client not configured, falling back to Azure Document Intelligence OCR.');
-    return await runAzureOCR();
+    throw new Error('Gemini client not configured. Cannot perform OCR table extraction.');
   }
 
   // Gemini OCR flow
   try {
-    console.log('[GEMINI] Starting Gemini Table Extraction OCR...');
+    console.log('[GEMINI] Starting Gemini Table Extraction OCR (No fallback)...');
     const base64Image = imageBuffer.toString('base64');
 
     const prompt = `You are an expert OCR and table extraction agent. Your job is to extract tabular sales/dispatch records from the provided spreadsheet image.
@@ -1555,13 +1350,8 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
 
     return { extractedText, recordResult };
   } catch (error) {
-    console.error('[GEMINI] Runtime error in Gemini performOCR. Falling back to Azure Document Intelligence OCR:', error);
-    try {
-      return await runAzureOCR();
-    } catch (fallbackError) {
-      console.error('Error in fallback Azure OCR:', fallbackError);
-      throw fallbackError;
-    }
+    console.error('Error in Gemini performOCR (No fallback):', error);
+    throw error;
   }
 }
 

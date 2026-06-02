@@ -335,7 +335,20 @@ const CDC_NAME_MAPPING = {
   'ภูเก็ต': 'ภูเก็ต',
   'เชียงใหม่': 'เชียงใหม่',
   'สุราษฎร์': 'สุราษฎร์',
-  'ขอนแก่น': 'ขอนแก่น'
+};
+
+const FC_TO_CDC = {
+  'FC03': 'นครราชสีมา',
+  'FC15': 'นครสวรรค์',
+  'FC12': 'ชลบุรี',
+  'FC01': 'บางบัวทอง',
+  'FC06': 'มหาชัย',
+  'FC08': 'สุวรรณภูมิ',
+  'FC33': 'หาดใหญ่',
+  'FC07': 'ภูเก็ต',
+  'FC32': 'สุราษฎร์',
+  'FC11': 'เชียงใหม่',
+  'FC02': 'ขอนแก่น'
 };
 
 // Detect product columns from table headers using longest-keyword-match scoring.
@@ -493,10 +506,10 @@ function validateTableData(table, detectedProducts) {
       const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
       const value = getRowProductValue(row, colIdx, rowIndex);
 
-      if (combinedC.includes('FC33') && combinedC.includes('หาดใหญ่')) {
+      if (combinedC.includes('FC33') || combinedC.includes('หาดใหญ่')) {
         hadyaiSum += value;
       }
-      if (combinedC.includes('FC07')) {
+      if (combinedC.includes('FC07') || combinedC.includes('ภูเก็ต')) {
         phuketSum += value;
       }
 
@@ -651,7 +664,10 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
     let bestCdcName = null;
     let bestScore = 0;
     for (const cdcName of CDC_NAMES) {
-      if (combinedC.includes(cdcName) && cdcName.length > bestScore) {
+      const fcCode = Object.keys(FC_TO_CDC).find(key => FC_TO_CDC[key] === cdcName);
+      const matchesCdc = combinedC.includes(cdcName);
+      const matchesFc = fcCode && combinedC.includes(fcCode);
+      if ((matchesCdc || matchesFc) && cdcName.length > bestScore) {
         bestCdcName = cdcName;
         bestScore = cdcName.length;
       }
@@ -1209,7 +1225,15 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
 Please analyze the image:
 1. Verify if it is a spreadsheet screenshot containing daily sales/dispatch records. Set is_excel_screenshot accordingly.
 2. Extract the entire table structure as a 2D array of strings (rows and columns). Preserve the layout. Empty or blank cells should be represented as empty strings (""). If cells are merged, fill the content in the top-left cell and leave others empty. Do not skip any rows or columns.
+CRITICAL: Do NOT merge rows or columns. The table has a strict grid layout with exactly 13 columns. Every row in your output MUST have exactly 13 elements. Do not shift columns to the left when cells are empty; keep them as empty strings (""). Each physical row in the spreadsheet image must correspond to one row in your output array. Do not combine multiple rows of the spreadsheet into a single row in the output.
+CRITICAL HEADER ROW INCLUSION:
+You MUST include all the header rows of the table (including the row with 'Vendor', 'คลังสินค้า', and the row with 'จำนวน น้ำ ส้ม (ขวด)', 'จำนวน น้ำ ส้มมุกป๊อป (ขวด)', etc.) as the very first rows in your extracted 2D array. The headers are a critical part of the table structure and must not be skipped.
+CRITICAL COLUMN PLACEMENT:
+- Column 0 ('Vendor') contains the FC code (e.g., 'FC03') and the destination CDC name (e.g., 'นครราชสีมา') written below it.
+- Column 1 ('คลังส่งสินค้า') contains the source warehouse (e.g., 'บางบัวทอง' or 'มหาชัย') when specified, or is blank.
+Do NOT put the destination CDC name into Column 1. If Column 1 is blank in the image, keep it as an empty string ("") in your output. Both the FC code and the destination CDC name MUST be kept in Column 0. Do not shift the destination CDC name to Column 1.
 3. Identify the "ยอดรวม" (grand total) or "รวม" row in the table. For each column containing product bottle counts (typically columns C2, C3, C4, etc.), extract the column index (0-indexed) and its corresponding total value from the grand total row, and populate the "yodruam_totals" array.
+4. Extract the date of the daily records (typically written after "วันที่" at the top of the spreadsheet, e.g. "วันที่ 01/06/2026"). Format it as DD/MM/YYYY and populate the "date" field.
 
 CRITICAL INSTRUCTION FOR COLUMN HEADERS:
 The column headers in this spreadsheet are written vertically in small cells, which makes them hard to read. They contain specific Thai words and units. Please transcribe them carefully to match the text in the image. The expected column headers are:
@@ -1225,9 +1249,7 @@ The column headers in this spreadsheet are written vertically in small cells, wh
 - 'เวลา โหลด สินค้า'
 - 'เวลา จัดส่ง สินค้า'
 
-Please map the vertically written text in the header cells to these exact phrases.
-
-Make sure you read all numbers and Thai characters (e.g., CDC names like 'บางบัวทอง', 'นครราชสีมา', 'ภูเก็ต', 'หาดใหญ่') extremely accurately.`;
+Please map the vertically written text in the header cells to these exact phrases.`;
 
     const response = await callGeminiWithRetry(() => gemini.models.generateContent({
       model: GEMINI_MODEL,
@@ -1249,6 +1271,10 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
             is_excel_screenshot: {
               type: 'BOOLEAN',
               description: 'Whether the image contains an Excel/spreadsheet style table grid with daily sales/dispatch records.'
+            },
+            date: {
+              type: 'STRING',
+              description: 'The date of the daily sales/dispatch records found in the image title or table, formatted as DD/MM/YYYY.'
             },
             table: {
               type: 'ARRAY',
@@ -1273,7 +1299,7 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
               description: 'Extracted total values from the "ยอดรวม" (grand total) row mapped to their column index.'
             }
           },
-          required: ['is_excel_screenshot', 'table']
+          required: ['is_excel_screenshot', 'table', 'date']
         }
       }
     }));
@@ -1298,7 +1324,7 @@ Make sure you read all numbers and Thai characters (e.g., CDC names like 'บา
     }
 
     let tableData = [resultJson.table];
-    let extractedText = resultJson.table.map(row => row.join('\t')).join('\n');
+    let extractedText = (resultJson.date ? `วันที่ ${resultJson.date}\n` : '') + resultJson.table.map(row => row.join('\t')).join('\n');
 
     console.log('[GEMINI] Table extracted rows:', resultJson.table.length);
     console.log('[GEMINI] Headers:', resultJson.table[0] ? resultJson.table[0].slice(0, 5).join(' | ') : 'None');
@@ -1490,7 +1516,10 @@ function transformTableData(tableData, columnIndex = 2) {
     let bestCdcName = null;
     let bestScore = 0;
     for (const cdcName of cdcNames) {
-      if (combinedC.includes(cdcName) && cdcName.length > bestScore) {
+      const fcCode = Object.keys(FC_TO_CDC).find(key => FC_TO_CDC[key] === cdcName);
+      const matchesCdc = combinedC.includes(cdcName);
+      const matchesFc = fcCode && combinedC.includes(fcCode);
+      if ((matchesCdc || matchesFc) && cdcName.length > bestScore) {
         bestCdcName = cdcName;
         bestScore = cdcName.length;
       }

@@ -1106,13 +1106,14 @@ async function handleEvent(event) {
         }
       } else {
         // Log failed detection - not an Excel screenshot
+        const detectReason = gemini ? 'Not an Excel screenshot (failed Gemini detection)' : 'Not an Excel screenshot (failed GPT-4 Vision detection)';
         await saveDetectionLog({
           timestamp: new Date().toISOString(),
           messageId: message.id,
           groupId: sourceInfo.groupId,
           userId: sourceInfo.userId,
           status: 'failed',
-          reason: 'Not an Excel screenshot (failed GPT-4 Vision detection)'
+          reason: detectReason
         });
         console.log('Image not detected as Excel screenshot, no reply sent');
       }

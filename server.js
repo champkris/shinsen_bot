@@ -229,8 +229,11 @@ function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, total
     return value;
   }
 
-  // If the cell is completely empty, check if we can infer it using grand total difference
-  if (reconstructed > 0 && table && totalsRowIndex !== -1 && yodruamTotal > 0) {
+  // If the cell is completely empty, check if we can infer it using grand total difference.
+  // These plans normally have NO totals row inside the table (the ยอดรวม row is OCR'd from
+  // raw page text), so totalsRowIndex is -1 in the common case — we must still run this.
+  // The inner loop already excludes row `totalsRowIndex` correctly (-1 matches no row).
+  if (reconstructed > 0 && table && yodruamTotal > 0) {
     // Check if other product columns in this row are empty/0
     let isOtherProductNonEmpty = false;
     for (let c = 2; c < 5; c++) {
@@ -3222,7 +3225,19 @@ app.get('/send-notification', (req, res) => {
   `);
 });
 
-app.listen(PORT, () => {
-  console.log(`LINE Bot server is running on port ${PORT}`);
-  console.log(`Webhook URL: http://localhost:${PORT}/webhook`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`LINE Bot server is running on port ${PORT}`);
+    console.log(`Webhook URL: http://localhost:${PORT}/webhook`);
+  });
+}
+
+// Exported for offline testing/validation harnesses (no effect when run as server)
+module.exports = {
+  getRowProductValue,
+  detectProductColumns,
+  extractCDCTotals,
+  extractYodruamTotals,
+  preprocessTableData,
+  CDC_NAME_MAPPING
+};

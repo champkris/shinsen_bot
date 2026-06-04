@@ -629,25 +629,47 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   const targetTotal = yodruamTotal > 0 ? yodruamTotal : totalSum;
 
   if (rawSum !== targetTotal && targetTotal > 0) {
+    const corrected = []; // entries we adjusted, with their in-range alternatives
+
     for (const entry of cdcRows) {
       if (entry.crateTotal < 2) continue;
       const ratio = entry.value / entry.crateTotal;
       if (ratio >= 20 || entry.value <= 1) continue;
 
-      // Value appears truncated - try appending digit 0-9
-      let bestCandidate = null;
+      // Value appears truncated (a digit was dropped) - try appending digit 0-9
+      // and keep EVERY candidate whose bottle/crate ratio is plausible. Several
+      // digits usually qualify (crates=2 admits 50..59), so the ratio alone can't
+      // pin the exact digit - that disambiguation happens against ยอดรวม below.
+      const candidates = [];
       for (let d = 0; d <= 9; d++) {
         const candidate = entry.value * 10 + d;
         const candRatio = candidate / entry.crateTotal;
-        if (candRatio >= 25 && candRatio <= 42) {
-          bestCandidate = { val: candidate, ratio: candRatio, digit: d };
-          break;
-        }
+        if (candRatio >= 25 && candRatio <= 42) candidates.push(candidate);
       }
+      if (candidates.length === 0) continue;
 
-      if (bestCandidate) {
-        console.log(`[RATIO-FIX] Row ${entry.rowIndex} (${entry.cdcName}): ${entry.value} → ${bestCandidate.val} (ratio ${ratio.toFixed(1)} → ${bestCandidate.ratio.toFixed(1)}, crates=${entry.crateTotal})`);
-        entry.value = bestCandidate.val;
+      const original = entry.value;
+      entry.value = candidates[0]; // provisional: smallest in-range value
+      corrected.push({ entry, candidates });
+      console.log(`[RATIO-FIX] Row ${entry.rowIndex} (${entry.cdcName}): ${original} → ${entry.value} (ratio ${(original / entry.crateTotal).toFixed(1)} → ${(entry.value / entry.crateTotal).toFixed(1)}, crates=${entry.crateTotal}, candidates=[${candidates.join(',')}])`);
+    }
+
+    // Pin the appended digit using the ยอดรวม grand total: re-pick each corrected
+    // entry's candidate to drive the corrected sum toward ยอดรวม. Without this, the
+    // first in-range digit wins (e.g. 5 → 50) even when another candidate (51) makes
+    // the column total reconcile exactly.
+    for (const c of corrected) {
+      let diff = targetTotal - cdcRows.reduce((s, r) => s + r.value, 0);
+      if (diff === 0) break;
+      let best = c.entry.value;
+      let bestDiff = Math.abs(diff);
+      for (const cand of c.candidates) {
+        const newDiff = Math.abs(diff - (cand - c.entry.value));
+        if (newDiff < bestDiff) { bestDiff = newDiff; best = cand; }
+      }
+      if (best !== c.entry.value) {
+        console.log(`[RATIO-FIX] Grand-total adjust Row ${c.entry.rowIndex} (${c.entry.cdcName}): ${c.entry.value} → ${best} (ratio ${(best / c.entry.crateTotal).toFixed(1)})`);
+        c.entry.value = best;
       }
     }
 

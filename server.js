@@ -3247,7 +3247,14 @@ app.get('/send-notification', (req, res) => {
   `);
 });
 
-if (require.main === module) {
+// Start the HTTP server unless explicitly imported for offline testing
+// (set NODE_ENV=test before requiring this file to skip listen).
+// NOTE: do NOT gate this on `require.main === module` — Phusion Passenger
+// (Plesk production) loads this file via require(), so require.main is the
+// Passenger loader, not this module. That makes the check false, listen()
+// never runs, and Passenger fails with "A timeout occurred while spawning
+// an application process".
+if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     console.log(`LINE Bot server is running on port ${PORT}`);
     console.log(`Webhook URL: http://localhost:${PORT}/webhook`);

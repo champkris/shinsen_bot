@@ -2803,6 +2803,57 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Network diagnostics — no SSH needed. Open in a browser and paste the JSON.
+// Isolates whether the OpenAI "Premature close" is IPv6, egress block, proxy,
+// request-size, or SDK-specific. Safe: never prints the API key.
+app.get('/diag', async (req, res) => {
+  const dnsp = require('dns').promises;
+  const out = { node: process.version, time: new Date().toISOString() };
+
+  out.proxyEnv = {
+    HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || null,
+    HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || null,
+    NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || null,
+  };
+
+  try {
+    out.dns = {
+      A: await dnsp.resolve4('api.openai.com').then(a => a.slice(0, 5)).catch(e => 'ERR ' + e.code),
+      AAAA: await dnsp.resolve6('api.openai.com').then(a => a.slice(0, 5)).catch(e => 'ERR ' + e.code),
+    };
+  } catch (e) { out.dns = 'ERR ' + e.message; }
+
+  // Raw HTTPS GET /v1/models with a forced IP family (isolates network from SDK)
+  function rawGet(family) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const agent = new https.Agent({ family, keepAlive: false });
+      const r = https.get('https://api.openai.com/v1/models', { agent, timeout: 15000 }, (resp) => {
+        let bytes = 0;
+        resp.on('data', c => (bytes += c.length));
+        resp.on('end', () => resolve({ ok: true, status: resp.statusCode, ip: resp.socket.remoteAddress, bytes, ms: Date.now() - started }));
+      });
+      r.on('timeout', () => r.destroy(new Error('timeout 15s')));
+      r.on('error', (e) => resolve({ ok: false, error: e.message, code: e.code, ms: Date.now() - started }));
+    });
+  }
+
+  out.rawGet_IPv4 = await rawGet(4);
+  out.rawGet_IPv6 = await rawGet(6);
+  out.rawGet_default = await rawGet(undefined);
+
+  // Real (tiny, text-only) OpenAI call through the configured SDK client (IPv4 agent)
+  try {
+    const t = Date.now();
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 5, messages: [{ role: 'user', content: 'say hi' }],
+    });
+    out.sdkChatTest = { ok: true, ms: Date.now() - t, reply: r.choices[0].message.content };
+  } catch (e) { out.sdkChatTest = { ok: false, error: e.message, code: e.code }; }
+
+  res.type('application/json').send(JSON.stringify(out, null, 2));
+});
+
 const PORT = process.env.PORT || 3000;
 // Detection logs endpoint
 app.get('/detection-logs', async (req, res) => {

@@ -30,6 +30,8 @@ const blobClient = new line.messagingApi.MessagingApiBlobClient({
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  timeout: 30000,   // fail fast (30s) instead of the SDK default 10min — avoids silent multi-minute hangs
+  maxRetries: 2,
 });
 
 const azureClient = new DocumentAnalysisClient(
@@ -1103,7 +1105,20 @@ async function handleEvent(event) {
       console.log('Detection result:', { isExcelScreenshot });
     } catch (error) {
       console.error('Error processing image:', error);
-      // Silent mode: don't reply on errors
+      // Silent mode: don't reply on errors — but record the failure so it
+      // surfaces on the web detection log instead of disappearing entirely.
+      try {
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: message.id,
+          groupId: sourceInfo.groupId,
+          userId: sourceInfo.userId,
+          status: 'error',
+          reason: `Processing failed before detection: ${error?.message || error}`
+        });
+      } catch (logError) {
+        console.error('Failed to write error detection log:', logError);
+      }
     }
   } else {
     console.log('Non-image message received:', message.type);

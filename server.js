@@ -2830,8 +2830,10 @@ app.get('/diag', async (req, res) => {
       const agent = new https.Agent({ family, keepAlive: false });
       const r = https.get('https://api.openai.com/v1/models', { agent, timeout: 15000 }, (resp) => {
         let bytes = 0;
+        const ip = resp.socket ? resp.socket.remoteAddress : null;
+        const status = resp.statusCode;
         resp.on('data', c => (bytes += c.length));
-        resp.on('end', () => resolve({ ok: true, status: resp.statusCode, ip: resp.socket.remoteAddress, bytes, ms: Date.now() - started }));
+        resp.on('end', () => resolve({ ok: true, status, ip, bytes, ms: Date.now() - started }));
       });
       r.on('timeout', () => r.destroy(new Error('timeout 15s')));
       r.on('error', (e) => resolve({ ok: false, error: e.message, code: e.code, ms: Date.now() - started }));
@@ -2842,14 +2844,57 @@ app.get('/diag', async (req, res) => {
   out.rawGet_IPv6 = await rawGet(6);
   out.rawGet_default = await rawGet(undefined);
 
-  // Real (tiny, text-only) OpenAI call through the configured SDK client (IPv4 agent)
+  // Raw POST /v1/chat/completions via Node https (bypasses the SDK / node-fetch).
+  // If this works but the SDK fails -> it's an SDK/node-fetch issue, not the network.
+  function rawPostChat(family, keepAlive) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const body = JSON.stringify({ model: 'gpt-4o', max_tokens: 5, messages: [{ role: 'user', content: 'say hi' }] });
+      const agent = new https.Agent({ family, keepAlive });
+      const r = https.request('https://api.openai.com/v1/chat/completions', {
+        method: 'POST', agent, timeout: 20000,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'Authorization': 'Bearer ' + (process.env.OPENAI_API_KEY || ''),
+        },
+      }, (resp) => {
+        let bytes = 0, snippet = '';
+        const ip = resp.socket ? resp.socket.remoteAddress : null;
+        const status = resp.statusCode;
+        resp.on('data', c => { bytes += c.length; if (snippet.length < 160) snippet += c.toString(); });
+        resp.on('end', () => resolve({ ok: true, status, ip, bytes, ms: Date.now() - started, snippet: snippet.slice(0, 160) }));
+      });
+      r.on('timeout', () => r.destroy(new Error('timeout 20s')));
+      r.on('error', (e) => resolve({ ok: false, error: e.message, code: e.code, ms: Date.now() - started }));
+      r.write(body); r.end();
+    });
+  }
+
+  out.rawPostChat_IPv4_noKeepAlive = await rawPostChat(4, false);
+  out.rawPostChat_IPv4_keepAlive = await rawPostChat(4, true);
+
+  // SDK via node-fetch v2 (current config: IPv4 + keep-alive agent)
   try {
     const t = Date.now();
     const r = await openai.chat.completions.create({
       model: 'gpt-4o', max_tokens: 5, messages: [{ role: 'user', content: 'say hi' }],
     });
-    out.sdkChatTest = { ok: true, ms: Date.now() - t, reply: r.choices[0].message.content };
-  } catch (e) { out.sdkChatTest = { ok: false, error: e.message, code: e.code }; }
+    out.sdkChatTest_nodeFetch = { ok: true, ms: Date.now() - t, reply: r.choices[0].message.content };
+  } catch (e) { out.sdkChatTest_nodeFetch = { ok: false, error: e.message, code: e.code }; }
+
+  // SDK forced to use Node 22 native fetch (undici) instead of node-fetch v2
+  try {
+    const t = Date.now();
+    const altClient = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY, timeout: 20000, maxRetries: 0,
+      fetch: (...a) => globalThis.fetch(...a),
+    });
+    const r = await altClient.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 5, messages: [{ role: 'user', content: 'say hi' }],
+    });
+    out.sdkChatTest_nativeFetch = { ok: true, ms: Date.now() - t, reply: r.choices[0].message.content };
+  } catch (e) { out.sdkChatTest_nativeFetch = { ok: false, error: e.message, code: e.code }; }
 
   res.type('application/json').send(JSON.stringify(out, null, 2));
 });

@@ -33,11 +33,13 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: 30000,   // fail fast (30s) instead of the SDK default 10min — avoids silent multi-minute hangs
   maxRetries: 2,
-  // Force IPv4 + keep-alive. Production hit "Premature close" on the OpenAI
-  // call (connection established then cut mid-response) while the same code
-  // worked locally — the classic signature of a broken IPv6 egress path or a
-  // firewall dropping the connection. Pinning IPv4 avoids the bad path.
-  httpAgent: new https.Agent({ family: 4, keepAlive: true }),
+  // Use Node's native fetch (undici) instead of the SDK's bundled node-fetch v2.
+  // On production every chat-completions POST failed with "Premature close"
+  // (ERR_STREAM_PREMATURE_CLOSE) while raw https and native fetch both worked —
+  // confirmed via /diag. It's a node-fetch v2 connection-handling bug on this
+  // host, not a network/firewall issue. httpAgent is intentionally omitted: it
+  // only applies to node-fetch, and there is no IPv6 route to pin anyway.
+  fetch: (...args) => globalThis.fetch(...args),
 });
 
 const azureClient = new DocumentAnalysisClient(

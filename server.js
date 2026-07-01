@@ -208,13 +208,83 @@ function parseOCRNumber(str) {
   return parseFloat(s) || 0;
 }
 
+// Locate the ตะกร้า (crate) columns from the header rows. Anchoring on the crate
+// headers — rather than a fixed offset — keeps the layout correct no matter how many
+// juice columns are added or removed, even a juice we have no detection keyword for.
+// Headers can be split across the first few rows (merged cells), so accumulate per column.
+function detectCrateColumns(table) {
+  const headerByCol = new Map();
+  for (let rowIdx = 0; rowIdx < Math.min(4, table.length); rowIdx++) {
+    const row = table[rowIdx];
+    if (!row) continue;
+    for (let colIdx = 0; colIdx < row.length; colIdx++) {
+      const cellText = row[colIdx] ? row[colIdx].toString() : '';
+      if (!cellText) continue;
+      headerByCol.set(colIdx, (headerByCol.get(colIdx) || '') + ' ' + cellText);
+    }
+  }
+
+  let fullCratesCol = null, partialCol = null, totalCratesCol = null, firstCrateCol = null;
+  for (const [colIdx, text] of headerByCol) {
+    if (!text.includes('ตะกร้า')) continue;                       // product headers never say ตะกร้า
+    if (firstCrateCol === null || colIdx < firstCrateCol) firstCrateCol = colIdx;
+    if (fullCratesCol === null && text.includes('เต็ม')) fullCratesCol = colIdx;
+    if (partialCol === null && text.includes('เศษ')) partialCol = colIdx;
+    if (totalCratesCol === null && text.includes('รวม')) totalCratesCol = colIdx;
+  }
+
+  // Crate columns always run เต็ม → เศษ → รวม in order. If OCR garbled a sub-label,
+  // fall back to that fixed order counting from the first ตะกร้า column.
+  if (firstCrateCol !== null && (fullCratesCol === null || partialCol === null || totalCratesCol === null)) {
+    fullCratesCol = firstCrateCol;
+    partialCol = firstCrateCol + 1;
+    totalCratesCol = firstCrateCol + 2;
+  }
+
+  return { firstCrateCol, fullCratesCol, partialCol, totalCratesCol };
+}
+
+// Derive product/crate column positions for a plan. The layout is
+// [vendor][warehouse][juice...][ตะกร้าเต็ม][ตะกร้าเศษ][ตะกร้ารวม][รถ]... where the number
+// of juice columns varies (2 = orange+pineapple, 3 = +pop, etc). Prefer anchoring the
+// crate columns on their headers so add/remove of any juice — even an unknown one — keeps
+// the crate positions (and the digit-recovery that depends on them) correct. Falls back to
+// "right of the last detected juice column" when the crate headers can't be read.
+function deriveLayout(productColumns, table = null) {
+  const detected = (productColumns && productColumns.length) ? [...productColumns] : [2, 3, 4];
+
+  const crates = table ? detectCrateColumns(table) : null;
+  if (crates && crates.fullCratesCol != null && crates.partialCol != null && crates.totalCratesCol != null) {
+    // Every column between warehouse (C1) and the first crate column holds a juice count,
+    // so this stays correct even for a juice type we have no keyword for.
+    const productCols = [];
+    for (let c = 2; c < crates.firstCrateCol; c++) productCols.push(c);
+    return {
+      productCols: productCols.length ? productCols : detected,
+      fullCratesCol: crates.fullCratesCol,
+      partialCol: crates.partialCol,
+      totalCratesCol: crates.totalCratesCol
+    };
+  }
+
+  // Fallback: no crate headers found — assume crates sit right of the last juice column.
+  const lastProductCol = Math.max(...detected);
+  return {
+    productCols: detected,
+    fullCratesCol: lastProductCol + 1,
+    partialCol: lastProductCol + 2,
+    totalCratesCol: lastProductCol + 3
+  };
+}
+
 // Get product value from a row, with fallback to crate-based reconstruction if the value is misread (non-numeric)
-function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, totalsRowIndex = -1, yodruamTotal = 0) {
+function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, totalsRowIndex = -1, yodruamTotal = 0, layout = null) {
   if (!row) return 0;
 
+  const lay = layout || deriveLayout(null);
   const rawValText = row[columnIndex] ? row[columnIndex].toString().trim() : '';
-  const fullCrates = row[5] ? parseOCRNumber(row[5]) : 0;
-  const partialBottles = row[6] ? parseOCRNumber(row[6]) : 0;
+  const fullCrates = row[lay.fullCratesCol] ? parseOCRNumber(row[lay.fullCratesCol]) : 0;
+  const partialBottles = row[lay.partialCol] ? parseOCRNumber(row[lay.partialCol]) : 0;
   const reconstructed = (fullCrates * 35) + partialBottles;
 
   if (rawValText !== '') {
@@ -222,7 +292,7 @@ function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, total
     if (value === 0 && reconstructed > 0) {
       // Check if this column is the active product column in this row (to avoid double-counting other products)
       let isOtherProductNonEmpty = false;
-      for (let c = 2; c < 5; c++) {
+      for (const c of lay.productCols) {
         if (c === columnIndex) continue;
         const otherVal = row[c] ? row[c].toString().trim() : '';
         if (otherVal !== '' && otherVal !== '0') {
@@ -246,7 +316,7 @@ function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, total
   if (reconstructed > 0 && table && yodruamTotal > 0) {
     // Check if other product columns in this row are empty/0
     let isOtherProductNonEmpty = false;
-    for (let c = 2; c < 5; c++) {
+    for (const c of lay.productCols) {
       if (c === columnIndex) continue;
       const otherVal = row[c] ? row[c].toString().trim() : '';
       if (otherVal !== '' && otherVal !== '0') {
@@ -263,7 +333,7 @@ function getRowProductValue(row, columnIndex, rowIndex = -1, table = null, total
         const rValText = table[i][columnIndex] ? table[i][columnIndex].toString().trim() : '';
         if (rValText !== '') {
           // Pass null for table to prevent infinite recursion
-          sumOfOtherRows += getRowProductValue(table[i], columnIndex, i);
+          sumOfOtherRows += getRowProductValue(table[i], columnIndex, i, null, -1, 0, lay);
         }
       }
 
@@ -448,6 +518,7 @@ function validateTableData(table, detectedProducts) {
   let hadyaiSum = 0;
   let phuketSum = 0;
   const zeroCells = [];
+  const layout = deriveLayout(productColumns, table);
 
   // Check all detected product columns for validation
   table.forEach((row, rowIndex) => {
@@ -459,7 +530,7 @@ function validateTableData(table, detectedProducts) {
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
       const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
-      const value = getRowProductValue(row, colIdx, rowIndex);
+      const value = getRowProductValue(row, colIdx, rowIndex, null, -1, 0, layout);
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
         hadyaiSum += value;
@@ -532,7 +603,8 @@ function extractDate(table, extractedText) {
 }
 
 // Extract CDC totals for a specific product column
-function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
+function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
+  const lay = layout || deriveLayout(null);
   const cdcTotals = {};
   let totalSum = 0;
   let totalsRowIndex = -1;
@@ -570,7 +642,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
       if (!row) continue;
 
       let largeValueCount = 0;
-      for (let col = 2; col <= 4; col++) {
+      for (const col of lay.productCols) {
         if (row[col]) {
           const val = parseOCRNumber(row[col]);
           if (val > 100) largeValueCount++;
@@ -592,7 +664,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
       if (i === totalsRowIndex) continue;
       const row = table[i];
       if (!row || !row[columnIndex]) continue;
-      const value = getRowProductValue(row, columnIndex, i);
+      const value = getRowProductValue(row, columnIndex, i, null, -1, 0, lay);
       if (value > 0) totalSum += value;
     }
   }
@@ -600,7 +672,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
   console.log(`[CDC] Extracting CDC values, excluding totals row index: ${totalsRowIndex}`);
 
   // Extract CDC values row by row, tracking individual contributions for ratio correction
-  const CRATE_TOTAL_COL = 7; // C7 = ตะกร้า รวม (total crates)
+  const CRATE_TOTAL_COL = lay.totalCratesCol; // ตะกร้า รวม (total crates) — right of the last product column
   const cdcRows = [];
 
   table.forEach((row, rowIndex) => {
@@ -625,7 +697,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0) {
     if (!bestCdcName) return;
 
     const fullCdcName = CDC_NAME_MAPPING[bestCdcName];
-    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamTotal);
+    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamTotal, lay);
     const crateTotal = row[CRATE_TOTAL_COL] ? parseOCRNumber(row[CRATE_TOTAL_COL]) : 0;
     if (value > 0) {
       cdcRows.push({ rowIndex, cdcName: fullCdcName, value, crateTotal });
@@ -873,6 +945,10 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
   // Step 5: Extract data for each detected product
   const results = [];
 
+  // Crate columns are located from the table headers, so a plan with any number of juice
+  // columns (added or removed) still finds ตะกร้า counts in the right place.
+  const layout = deriveLayout(Object.values(detectedProducts).map(p => p.column), table);
+
   for (const [productKey, productInfo] of Object.entries(detectedProducts)) {
     const category = productInfo.dbCategory;
     const columnIndex = productInfo.column;
@@ -888,7 +964,7 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
 
     // Extract CDC totals, passing ยอดรวม for ratio-based correction of truncated values
     const yodruamValue = yodruamTotals[columnIndex] || 0;
-    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex, yodruamValue);
+    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex, yodruamValue, layout);
 
     // Use ยอดรวม from raw text as authoritative total when available
     let finalTotalSum = totalSum;
@@ -1386,6 +1462,9 @@ function transformTableData(tableData, columnIndex = 2) {
 
   const table = tableData[0];
 
+  // Crate columns are located from the table headers, so any number of juice columns works.
+  const layout = deriveLayout(Object.values(detectProductColumns(table)).map(p => p.column), table);
+
   // Initialize totals for all CDC locations
   const cdcTotals = {};
   cdcOrder.forEach(cdc => {
@@ -1435,7 +1514,7 @@ function transformTableData(tableData, columnIndex = 2) {
     }
     if (!bestCdcName) return;
 
-    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamValue);
+    const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamValue, layout);
     if (value > 0) {
       cdcTotals[cdcNameMapping[bestCdcName]] += value;
     }
@@ -3384,6 +3463,8 @@ if (process.env.NODE_ENV !== 'test') {
 module.exports = {
   getRowProductValue,
   detectProductColumns,
+  detectCrateColumns,
+  deriveLayout,
   extractCDCTotals,
   extractYodruamTotals,
   preprocessTableData,

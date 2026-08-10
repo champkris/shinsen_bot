@@ -328,6 +328,51 @@ async function upsertTarget(year, month, category, value) {
   );
 }
 
+// Has this LINE message already been through the pipeline? Used to make webhook
+// handling idempotent so LINE's webhook redelivery cannot double-process an image.
+async function hasProcessedMessage(messageId) {
+  if (!messageId) return false;
+  const [rows] = await pool.execute(
+    'SELECT 1 FROM detection_logs WHERE message_id = ? LIMIT 1',
+    [messageId]
+  );
+  return rows.length > 0;
+}
+
+// Dates (YYYY-MM-DD strings) in an inclusive range that have at least one recorded
+// category. DATE_FORMAT keeps this a string end-to-end — a JS Date round-trip would
+// shift the day across timezones.
+async function getRecordedDates(startDate, endDate) {
+  const [rows] = await pool.execute(
+    `SELECT DISTINCT DATE_FORMAT(date, '%Y-%m-%d') AS d
+     FROM daily_records
+     WHERE date BETWEEN ? AND ?
+     ORDER BY d ASC`,
+    [startDate, endDate]
+  );
+  return rows.map(row => row.d);
+}
+
+// Watchdog alert bookkeeping — one row per (date, kind) so a missing day is
+// reported once, not on every watchdog run.
+async function hasWatchdogAlert(date, kind = 'missing_data') {
+  const [rows] = await pool.execute(
+    'SELECT 1 FROM watchdog_alerts WHERE alert_date = ? AND kind = ? LIMIT 1',
+    [toMySQLDate(date), kind]
+  );
+  return rows.length > 0;
+}
+
+async function recordWatchdogAlert(date, kind = 'missing_data') {
+  const [result] = await pool.execute(
+    `INSERT INTO watchdog_alerts (alert_date, kind, sent_at)
+     VALUES (?, ?, NOW())
+     ON DUPLICATE KEY UPDATE sent_at = VALUES(sent_at)`,
+    [toMySQLDate(date), kind]
+  );
+  return result;
+}
+
 // Test database connection
 async function testConnection() {
   try {
@@ -356,6 +401,10 @@ module.exports = {
   getTargets,
   getTargetsYTD,
   upsertTarget,
+  hasProcessedMessage,
+  getRecordedDates,
+  hasWatchdogAlert,
+  recordWatchdogAlert,
   testConnection,
   toMySQLDate,
   toDisplayDate,

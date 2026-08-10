@@ -62,9 +62,25 @@ const NOTIFICATION_GROUP_IDS = process.env.NOTIFICATION_GROUP_IDS
 // Auto-send notification after successful extraction (default: true)
 const AUTO_NOTIFY = process.env.AUTO_NOTIFY?.toLowerCase() !== 'false';
 
+// Groups that receive operational alerts from the watchdog (a day with no data).
+// Deliberately separate from NOTIFICATION_GROUP_IDS: those are the customer-facing
+// "report recorded" groups and should not receive ops noise.
+const ALERT_GROUP_IDS = process.env.ALERT_GROUP_IDS
+  ? process.env.ALERT_GROUP_IDS.split(',').map(id => id.trim()).filter(id => id)
+  : [];
+
+// How many days back the watchdog looks for missing data, and the hour (Bangkok time)
+// after which the current day is expected to have been reported.
+const WATCHDOG_LOOKBACK_DAYS = parseInt(process.env.WATCHDOG_LOOKBACK_DAYS || '7', 10);
+const WATCHDOG_CUTOFF_HOUR = parseInt(process.env.WATCHDOG_CUTOFF_HOUR || '15', 10);
+
 console.log('[CONFIG] Notification groups configured:', NOTIFICATION_GROUP_IDS.length);
 console.log('[CONFIG] Notification group IDs:', NOTIFICATION_GROUP_IDS);
 console.log('[CONFIG] Auto-notify:', AUTO_NOTIFY);
+console.log('[CONFIG] Alert groups configured:', ALERT_GROUP_IDS.length);
+if (ALERT_GROUP_IDS.length === 0) {
+  console.warn('[CONFIG] WARNING: ALERT_GROUP_IDS is empty — the missing-data watchdog will log but cannot notify anyone');
+}
 
 // Test database connection on startup
 db.testConnection().then(connected => {
@@ -150,6 +166,27 @@ async function sendNotificationToGroups(date, categories) {
     }
   }
   console.log('[NOTIFICATION] sendNotificationToGroups completed');
+}
+
+// Push an operational alert to the alert groups. Never throws: an alert that fails
+// to send must not take down whatever called it.
+async function sendAlertToGroups(text) {
+  if (ALERT_GROUP_IDS.length === 0) {
+    console.warn('[ALERT] No alert groups configured, alert not sent:', text.split('\n')[0]);
+    return false;
+  }
+
+  let sent = false;
+  for (const groupId of ALERT_GROUP_IDS) {
+    try {
+      await client.pushMessage({ to: groupId, messages: [{ type: 'text', text }] });
+      console.log(`[ALERT] Sent alert to group: ${groupId}`);
+      sent = true;
+    } catch (error) {
+      console.error(`[ALERT] Failed to send alert to group ${groupId}:`, error.message);
+    }
+  }
+  return sent;
 }
 
 // Check if date already exists in records (uses MySQL)
@@ -1088,16 +1125,25 @@ app.use((req, res, next) => {
 });
 
 // LINE webhook - must be before express.json() to preserve raw body for signature validation
-app.post('/webhook', line.middleware(config), async (req, res) => {
-  try {
-    console.log('[WEBHOOK] Received webhook request');
-    console.log('[WEBHOOK] Number of events:', req.body.events?.length || 0);
-    const results = await Promise.all(req.body.events.map(handleEvent));
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[ERROR] Error handling webhook:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+app.post('/webhook', line.middleware(config), (req, res) => {
+  const events = req.body.events || [];
+  console.log('[WEBHOOK] Received webhook request');
+  console.log('[WEBHOOK] Number of events:', events.length);
+  if (req.body.destination) console.log('[WEBHOOK] Destination:', req.body.destination);
+
+  // Acknowledge before processing. A full image run (Vision + Azure OCR) takes ~15s,
+  // far past LINE's webhook timeout — answering only after it finished made LINE
+  // record the delivery as failed, and with redelivery enabled it would resend the
+  // same event while the first run was still going. handleEvent is idempotent per
+  // message ID, so a redelivery that does slip through is a no-op.
+  res.json({ success: true });
+
+  Promise.all(events.map(event =>
+    handleEvent(event).catch(err => {
+      console.error('[ERROR] Unhandled error in handleEvent:', err);
+      return null;
+    })
+  )).then(() => console.log('[WEBHOOK] Finished processing', events.length, 'event(s)'));
 });
 
 // Add JSON parsing middleware for other endpoints (after LINE webhook)
@@ -1106,6 +1152,9 @@ app.use(express.urlencoded({ extended: true }));
 
 async function handleEvent(event) {
   console.log('[EVENT] Event type:', event.type);
+  if (event.deliveryContext?.isRedelivery) {
+    console.log('[EVENT] This is a REDELIVERY from LINE');
+  }
 
   // Log source information (group ID, user ID, etc.)
   const sourceInfo = {
@@ -1135,6 +1184,19 @@ async function handleEvent(event) {
   if (message.type === 'image') {
     console.log('[IMAGE] Image message detected:', message.id);
 
+    // Every finished run writes a detection log keyed by message ID, so an existing
+    // log means this image was already handled — skip it. Without this, LINE's
+    // webhook redelivery would re-run OCR and re-notify for the same screenshot.
+    try {
+      if (await db.hasProcessedMessage(message.id)) {
+        console.log('[IMAGE] Message already processed, skipping (redelivery):', message.id);
+        return null;
+      }
+    } catch (dedupeError) {
+      // A dedupe lookup failure must not block processing — worst case is a duplicate.
+      console.error('[IMAGE] Dedupe check failed, processing anyway:', dedupeError.message);
+    }
+
     try {
       console.log('[IMAGE] Fetching image content...');
       const imageBuffer = await getImageContent(message.id);
@@ -1153,15 +1215,21 @@ async function handleEvent(event) {
         if (recordResult && recordResult.success) {
           const replyMessage = `Report for ${recordResult.date} has been recorded\n\nDaily report: https://shinsen.yushi-marketing.com/daily-report\nMTD / YTD report: https://shinsen.yushi-marketing.com/mtd-report`;
 
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{
-              type: 'text',
-              text: replyMessage,
-            }],
-          });
-
-          console.log('Success message sent to user');
+          // The reply is best-effort. A redelivered event carries a reply token that
+          // has already expired, and letting that throw would skip the group
+          // notification below for data that was, in fact, recorded successfully.
+          try {
+            await client.replyMessage({
+              replyToken: event.replyToken,
+              messages: [{
+                type: 'text',
+                text: replyMessage,
+              }],
+            });
+            console.log('Success message sent to user');
+          } catch (replyError) {
+            console.warn('[REPLY] Could not reply (expired token on redelivery?):', replyError.message);
+          }
 
           // Send notifications to configured groups (if AUTO_NOTIFY is enabled)
           if (AUTO_NOTIFY) {
@@ -2880,8 +2948,135 @@ app.get('/test', (req, res) => {
   `);
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+// ---------- Missing-data watchdog ----------
+//
+// A LINE webhook that never arrives leaves no trace anywhere in this app — no log
+// line, no detection_logs row — so a whole day of data can go missing silently
+// (this is what happened on 09/08/2026). The watchdog closes that gap by checking
+// the data itself rather than the delivery path, and alerting on any expected day
+// that has no record at all.
+
+const BANGKOK_TZ = 'Asia/Bangkok';
+
+// Current date/hour in Bangkok, independent of the server's own timezone.
+function bangkokNow() {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: BANGKOK_TZ,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', hourCycle: 'h23'
+    }).formatToParts(new Date()).map(p => [p.type, p.value])
+  );
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: parseInt(parts.hour, 10) % 24 };
+}
+
+// Shift a YYYY-MM-DD string by whole days. UTC arithmetic keeps DST and local
+// timezone out of it — the string in, string out contract is what callers compare.
+function shiftDate(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function isoToThaiDisplay(isoDate) {
+  const [y, m, d] = isoDate.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+async function runWatchdog({ dryRun = false } = {}) {
+  const { date: today, hour } = bangkokNow();
+
+  // Today only counts as overdue once the plan is normally in (WATCHDOG_CUTOFF_HOUR),
+  // otherwise every morning would report the current day as missing.
+  const includeToday = hour >= WATCHDOG_CUTOFF_HOUR;
+  const lastExpected = includeToday ? today : shiftDate(today, -1);
+  const firstExpected = shiftDate(lastExpected, -(WATCHDOG_LOOKBACK_DAYS - 1));
+
+  const recorded = new Set(await db.getRecordedDates(firstExpected, lastExpected));
+  const expected = [];
+  for (let d = firstExpected; d <= lastExpected; d = shiftDate(d, 1)) expected.push(d);
+  const missing = expected.filter(d => !recorded.has(d));
+
+  console.log(`[WATCHDOG] Window ${firstExpected}..${lastExpected} — ${recorded.size} day(s) recorded, ${missing.length} missing`);
+
+  if (missing.length === 0) {
+    return { window: { from: firstExpected, to: lastExpected }, missing: [], alerted: [], alreadyAlerted: [] };
+  }
+
+  // Report each missing day once. Days already alerted stay in the response so the
+  // problem remains visible, but they do not re-notify the group every run.
+  const toAlert = [];
+  const alreadyAlerted = [];
+  for (const date of missing) {
+    if (await db.hasWatchdogAlert(date)) alreadyAlerted.push(date);
+    else toAlert.push(date);
+  }
+
+  if (toAlert.length === 0 || dryRun) {
+    console.log(`[WATCHDOG] ${dryRun ? 'Dry run' : 'Nothing new'} — missing: ${missing.join(', ')}`);
+    return { window: { from: firstExpected, to: lastExpected }, missing, alerted: [], alreadyAlerted, dryRun };
+  }
+
+  const dateList = toAlert.map(isoToThaiDisplay).join('\n');
+  const message =
+    `⚠️ ไม่พบข้อมูล Plan ส่งสินค้า\n\n` +
+    `วันที่ยังไม่มีข้อมูลในระบบ:\n${dateList}\n\n` +
+    `กรุณาส่งรูปเข้ากลุ่มอีกครั้ง หรืออัปโหลดที่\n` +
+    `https://shinsen.yushi-marketing.com/test`;
+
+  const sent = await sendAlertToGroups(message);
+  // Only mark as alerted when the push actually went out, so a LINE outage does not
+  // silently swallow the one notification a missing day ever gets.
+  if (sent) {
+    for (const date of toAlert) await db.recordWatchdogAlert(date);
+  }
+
+  return { window: { from: firstExpected, to: lastExpected }, missing, alerted: sent ? toAlert : [], alreadyAlerted, sent };
+}
+
+// Hit this from an external scheduler (cron / uptime monitor) — it is the only part
+// of the system that can notice data missing because the app was never reached.
+app.get('/watchdog', async (req, res) => {
+  try {
+    const result = await runWatchdog({ dryRun: req.query.dry === '1' });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[WATCHDOG] Run failed:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// The app is spawned per request on this host, so a boot-time run gives the watchdog
+// coverage on ordinary traffic even without a scheduler. It cannot replace one: a
+// total outage means no boot, and therefore no check.
+if (process.env.WATCHDOG_ON_BOOT?.toLowerCase() !== 'false') {
+  setTimeout(() => {
+    runWatchdog().catch(error => console.error('[WATCHDOG] Boot run failed:', error.message));
+  }, 5000).unref?.();
+}
+
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'ok',
+    time: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime())
+  };
+
+  try {
+    health.db = (await db.testConnection()) ? 'ok' : 'error';
+    const { date } = bangkokNow();
+    const recent = await db.getRecordedDates(shiftDate(date, -14), date);
+    health.lastRecordedDate = recent.length ? isoToThaiDisplay(recent[recent.length - 1]) : null;
+  } catch (error) {
+    health.db = 'error';
+    health.error = error.message;
+  }
+
+  if (health.db !== 'ok') {
+    health.status = 'error';
+    return res.status(503).json(health);
+  }
+  res.json(health);
 });
 
 // Network diagnostics — no SSH needed. Open in a browser and paste the JSON.

@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS monthly_targets (
   INDEX idx_year_month (year, month)
 );
 
+-- Table: watchdog_alerts
+-- One row per day already reported missing, so the watchdog alerts once per date
+-- instead of on every run
+CREATE TABLE IF NOT EXISTS watchdog_alerts (
+  alert_date DATE NOT NULL,
+  kind VARCHAR(32) NOT NULL DEFAULT 'missing_data',
+  sent_at DATETIME NOT NULL,
+  PRIMARY KEY (alert_date, kind)
+);
+
 -- Table: detection_logs
 -- Stores logs from image detection attempts
 CREATE TABLE IF NOT EXISTS detection_logs (

@@ -25,6 +25,7 @@ The monolithic application file containing:
 - **LINE webhook handler** (`POST /webhook`): Receives image messages, downloads from LINE, sends to GPT-4o Vision for Excel detection, then to Azure OCR for data extraction
 - **OCR processing pipeline**: Azure Document Intelligence extracts tables → preprocesses merged cells (fill-down) → dynamically detects product columns from headers → extracts CDC warehouse totals → saves to MySQL
 - **Web dashboard routes**: `/daily-report`, `/latest-ocr`, `/transformed-data`, `/detection-logs`, `/send-notification`, `/test` — all rendered as inline HTML (no template engine)
+- **Operational routes**: `/health` (DB status + last recorded date, 503 when the DB is down), `/watchdog` (missing-data check, meant to be called by an external scheduler), `/diag` (OpenAI connectivity probe)
 
 ### db.js (~280 lines)
 
@@ -51,6 +52,8 @@ Database abstraction layer:
 - **Categories**: 5 product types — orange, yuzu, pop (Shinsen Pop), mixed (น้ำผลไม้รวม), tomato (Tomato Yuzu)
 - **Dynamic product detection**: Product columns are identified from Excel header rows using keyword matching, not hardcoded positions
 - **Totals row exclusion**: The totals row at the bottom of tables is excluded from CDC calculations to avoid double-counting
+- **Missing-data watchdog**: A webhook LINE never delivers leaves no trace in this app — no log, no `detection_logs` row — so a whole day can go missing silently. `runWatchdog()` checks `daily_records` for expected days instead of trusting the delivery path, and alerts `ALERT_GROUP_IDS` once per missing date (dedup via the `watchdog_alerts` table). It runs on boot and via `GET /watchdog`; an external scheduler is still required, since a total outage means the app never boots
+- **Webhook idempotency**: `/webhook` acknowledges LINE before processing (a full OCR run takes ~15s, well past LINE's timeout). `handleEvent` skips images whose message ID already has a `detection_logs` row, so LINE webhook redelivery cannot double-process a screenshot
 
 ### Environment Variables
 

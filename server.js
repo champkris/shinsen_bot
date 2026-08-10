@@ -3051,10 +3051,16 @@ async function runWatchdog({ dryRun = false } = {}) {
 
 // Hit this from an external scheduler (cron / uptime monitor) — it is the only part
 // of the system that can notice data missing because the app was never reached.
+// ?dry=1    — report without notifying
+// ?strict=1 — answer 409 when a day is missing, so `curl -f` exits non-zero and the
+//             scheduler that called it raises the alarm. This is the escape hatch for
+//             setups that want no LINE alert at all: leave ALERT_GROUP_IDS empty and
+//             let cron mail the failure instead.
 app.get('/watchdog', async (req, res) => {
   try {
     const result = await runWatchdog({ dryRun: req.query.dry === '1' });
-    res.json({ success: true, ...result });
+    const status = (req.query.strict === '1' && result.missing.length > 0) ? 409 : 200;
+    res.status(status).json({ success: true, ...result });
   } catch (error) {
     console.error('[WATCHDOG] Run failed:', error);
     res.status(500).json({ success: false, error: error.message });

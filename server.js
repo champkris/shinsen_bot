@@ -2339,12 +2339,19 @@ app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (re
 
     if (isExcelScreenshot) {
       console.log('[TEST-OCR] Performing OCR...');
-      const extractedText = await performOCR(imageBuffer);
+      // performOCR returns { extractedText, recordResult } — assigning the whole
+      // object to extractedText made the page call .substring() on an object and
+      // report an error for uploads that had in fact been recorded correctly.
+      const { extractedText, recordResult } = await performOCR(imageBuffer);
 
       res.json({
         success: true,
         isExcelScreenshot: true,
         extractedText: extractedText,
+        recorded: !!(recordResult && recordResult.success),
+        date: recordResult?.date || null,
+        categories: recordResult?.results?.map(r => r.category) || [],
+        reason: recordResult?.reason || null,
         tableData: latestOCRResult.tableData,
         cdcTotals: latestOCRResult.tableData ? transformTableData(latestOCRResult.tableData) : null
       });
@@ -2922,13 +2929,21 @@ app.get('/test', (req, res) => {
             if (data.success) {
               result.style.display = 'block';
               if (data.isExcelScreenshot) {
+                // Whether the data actually reached the database is the point of this
+                // page — detecting a spreadsheet but silently failing validation used
+                // to look identical to a successful upload.
+                const saved = data.recorded
+                  ? \`<p style="color: #1b7a2f;"><strong>💾 บันทึกแล้ว:</strong> \${data.date} — \${data.categories.join(', ')}</p>\`
+                  : \`<p style="color: #c62828;"><strong>⚠️ ไม่ได้บันทึกลงฐานข้อมูล:</strong> \${data.reason || 'ไม่พบสาเหตุ ดูที่หน้า Detection Logs'}</p>\`;
+                const text = data.extractedText || '';
                 result.innerHTML = \`
                   <h3>✅ Excel Screenshot Detected!</h3>
-                  <p><strong>Extracted Text Length:</strong> \${data.extractedText.length} characters</p>
+                  \${saved}
+                  <p><strong>Extracted Text Length:</strong> \${text.length} characters</p>
                   <p><strong>Tables Found:</strong> \${data.tableData ? data.tableData.length : 0}</p>
                   <h4>Preview:</h4>
-                  <pre style="max-height: 300px; overflow-y: auto; background: white; padding: 10px;">\${data.extractedText.substring(0, 1000)}...</pre>
-                  <p><a href="/latest-ocr" target="_blank">View Full Results</a></p>
+                  <pre style="max-height: 300px; overflow-y: auto; background: white; padding: 10px;">\${text.substring(0, 1000)}...</pre>
+                  <p><a href="/latest-ocr" target="_blank">View Full Results</a> | <a href="/daily-report" target="_blank">Daily Report</a></p>
                 \`;
               } else {
                 result.innerHTML = '<h3>❌ Not detected as Excel screenshot</h3>';

@@ -1894,6 +1894,12 @@ app.get('/transformed-data', (req, res) => {
   `);
 });
 
+// The bare domain has no page of its own — send it to the report people actually
+// open. Note this only takes effect once the Plesk default index.html is gone from
+// the document root: the web server serves static files before handing anything to
+// Passenger, so that file wins over this route while it exists.
+app.get('/', (req, res) => res.redirect('/daily-report'));
+
 app.get('/daily-report', async (req, res) => {
   try {
     // Get current date for default filter

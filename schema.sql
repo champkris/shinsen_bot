@@ -57,6 +57,25 @@ CREATE TABLE IF NOT EXISTS watchdog_alerts (
   PRIMARY KEY (alert_date, kind)
 );
 
+-- Table: pending_events
+-- Durable work queue for LINE image events. The webhook writes a row here and
+-- returns 200 immediately; the actual OCR run happens later. Passenger tears the
+-- app process down once no request is in flight, so any work left running after
+-- the response can be killed mid-flight — a row that survives in this table is
+-- what makes that recoverable instead of a silently lost screenshot.
+CREATE TABLE IF NOT EXISTS pending_events (
+  message_id VARCHAR(255) NOT NULL PRIMARY KEY,
+  event_json MEDIUMTEXT NOT NULL,
+  status ENUM('pending', 'processing', 'done', 'failed') NOT NULL DEFAULT 'pending',
+  attempts INT NOT NULL DEFAULT 0,
+  claimed_by VARCHAR(64) DEFAULT NULL,
+  claimed_at DATETIME DEFAULT NULL,
+  last_error TEXT DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_status_created (status, created_at)
+);
+
 -- Table: detection_logs
 -- Stores logs from image detection attempts
 CREATE TABLE IF NOT EXISTS detection_logs (

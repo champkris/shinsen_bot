@@ -12,6 +12,36 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+// The queue table is created on boot rather than by a deploy step. Deploys here are
+// "upload files, press Restart App" in the Plesk panel with no shell in the loop, so a
+// migration that has to be remembered is a migration that gets skipped — and skipping
+// this one silently turns every incoming image back into a lost screenshot.
+// CREATE TABLE IF NOT EXISTS is a no-op once the table exists, which is the normal
+// case for all 35-50 of this process's daily boots.
+const PENDING_EVENTS_DDL = `
+  CREATE TABLE IF NOT EXISTS pending_events (
+    message_id VARCHAR(255) NOT NULL PRIMARY KEY,
+    event_json MEDIUMTEXT NOT NULL,
+    status ENUM('pending', 'processing', 'done', 'failed') NOT NULL DEFAULT 'pending',
+    attempts INT NOT NULL DEFAULT 0,
+    claimed_by VARCHAR(64) DEFAULT NULL,
+    claimed_at DATETIME DEFAULT NULL,
+    last_error TEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_status_created (status, created_at)
+  )
+`;
+
+// Resolves either way: a DB user without CREATE rights must still get a working app
+// (the webhook falls back to inline processing), not a boot that hangs on schema setup.
+const schemaReady = pool.query(PENDING_EVENTS_DDL)
+  .then(() => { console.log('[DB] pending_events ready'); return true; })
+  .catch(error => {
+    console.error('[DB] Could not ensure pending_events table:', error.message);
+    return false;
+  });
+
 // CDC name mapping from Thai to database column names
 const cdcColumnMapping = {
   'คลังบางบัวทอง': 'cdc_bangbuathong',
@@ -330,10 +360,14 @@ async function upsertTarget(year, month, category, value) {
 
 // Has this LINE message already been through the pipeline? Used to make webhook
 // handling idempotent so LINE's webhook redelivery cannot double-process an image.
+// 'error' rows are deliberately excluded: they mean the run blew up before reaching
+// a verdict, so the image still needs processing. Counting them would let one
+// transient LINE/Azure blip permanently mark a screenshot as handled — the retries
+// would all short-circuit here and the data would never arrive.
 async function hasProcessedMessage(messageId) {
   if (!messageId) return false;
   const [rows] = await pool.execute(
-    'SELECT 1 FROM detection_logs WHERE message_id = ? LIMIT 1',
+    "SELECT 1 FROM detection_logs WHERE message_id = ? AND status IN ('success', 'failed') LIMIT 1",
     [messageId]
   );
   return rows.length > 0;
@@ -373,6 +407,113 @@ async function recordWatchdogAlert(date, kind = 'missing_data') {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Durable event queue
+//
+// Passenger reaps the app process as soon as no HTTP request is in flight, so
+// anything still running after the webhook responds can be killed mid-run — that
+// is how a screenshot that GPT-4 Vision had already accepted disappeared without
+// even a detection_logs row. Every image event is written here inside the webhook
+// request (a ~10ms INSERT that always beats the teardown) and processed later,
+// so a killed run leaves a claimable row behind instead of nothing.
+// ---------------------------------------------------------------------------
+
+// Queue an event, leaving any existing row untouched: a LINE redelivery must not
+// resurrect a row already marked done or reset its attempt count. INSERT IGNORE
+// rather than ON DUPLICATE KEY UPDATE because MariaDB reports affectedRows = 1 for
+// the no-op update branch, which makes "was this new?" unanswerable there.
+// Returns true only when the row was actually inserted.
+async function enqueueEvent(messageId, event) {
+  if (!messageId) return false;
+  // The very first webhook after a deploy can land before the DDL finishes.
+  await schemaReady;
+  const [result] = await pool.execute(
+    'INSERT IGNORE INTO pending_events (message_id, event_json) VALUES (?, ?)',
+    [messageId, JSON.stringify(event)]
+  );
+  return result.affectedRows === 1;
+}
+
+// Take ownership of up to `limit` events. Rows stuck in 'processing' past
+// staleSeconds are reclaimed — that is the crash path: the process died holding
+// the claim, so nobody will ever finish or release it.
+async function claimPendingEvents(claimToken, { limit = 3, staleSeconds = 180, maxAttempts = 5 } = {}) {
+  await schemaReady;
+  await pool.execute(
+    `UPDATE pending_events
+        SET status = 'processing', claimed_by = ?, claimed_at = NOW(), attempts = attempts + 1
+      WHERE (status = 'pending'
+             OR (status = 'processing' AND claimed_at < NOW() - INTERVAL ? SECOND))
+        AND attempts < ?
+      ORDER BY created_at ASC
+      LIMIT ?`,
+    [claimToken, staleSeconds, maxAttempts, limit]
+  );
+
+  const [rows] = await pool.execute(
+    `SELECT message_id, event_json, attempts
+       FROM pending_events
+      WHERE claimed_by = ? AND status = 'processing'
+      ORDER BY created_at ASC`,
+    [claimToken]
+  );
+
+  return rows.map(row => ({
+    messageId: row.message_id,
+    event: JSON.parse(row.event_json),
+    attempts: row.attempts
+  }));
+}
+
+async function completeEvent(messageId) {
+  await pool.execute(
+    `UPDATE pending_events
+        SET status = 'done', claimed_by = NULL, claimed_at = NULL, last_error = NULL
+      WHERE message_id = ?`,
+    [messageId]
+  );
+}
+
+// Hand the row back for a later attempt, or bury it once it has burned through
+// maxAttempts so a permanently broken event cannot loop forever.
+async function releaseEvent(messageId, errorMessage, maxAttempts = 5) {
+  const [result] = await pool.execute(
+    `UPDATE pending_events
+        SET status = IF(attempts >= ?, 'failed', 'pending'),
+            claimed_by = NULL, claimed_at = NULL, last_error = ?
+      WHERE message_id = ?`,
+    [maxAttempts, errorMessage ? String(errorMessage).slice(0, 1000) : null, messageId]
+  );
+  if (result.affectedRows === 0) return null;
+  const [rows] = await pool.execute(
+    'SELECT status, attempts FROM pending_events WHERE message_id = ?',
+    [messageId]
+  );
+  return rows[0] || null;
+}
+
+// Rows still owing work, oldest first — what /health and the queue page report.
+async function getQueueStats() {
+  const stats = { pending: 0, processing: 0, done: 0, failed: 0, oldestUnfinished: null };
+  // Reported on /health, so a missing table must degrade to a note on the queue —
+  // not a 503 that says the whole database is down.
+  if (!(await schemaReady)) return { ...stats, error: 'pending_events table unavailable' };
+
+  const [rows] = await pool.execute(
+    `SELECT status, COUNT(*) AS n, MIN(created_at) AS oldest
+       FROM pending_events
+      GROUP BY status`
+  );
+  for (const row of rows) {
+    stats[row.status] = Number(row.n) || 0;
+    if ((row.status === 'pending' || row.status === 'processing') && row.oldest) {
+      const oldest = new Date(row.oldest).toISOString();
+      if (!stats.oldestUnfinished || oldest < stats.oldestUnfinished) stats.oldestUnfinished = oldest;
+    }
+  }
+  return stats;
+}
+
 // Test database connection
 async function testConnection() {
   try {
@@ -405,6 +546,11 @@ module.exports = {
   getRecordedDates,
   hasWatchdogAlert,
   recordWatchdogAlert,
+  enqueueEvent,
+  claimPendingEvents,
+  completeEvent,
+  releaseEvent,
+  getQueueStats,
   testConnection,
   toMySQLDate,
   toDisplayDate,

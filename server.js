@@ -1125,7 +1125,7 @@ app.use((req, res, next) => {
 });
 
 // LINE webhook - must be before express.json() to preserve raw body for signature validation
-app.post('/webhook', line.middleware(config), (req, res) => {
+app.post('/webhook', line.middleware(config), async (req, res) => {
   const events = req.body.events || [];
   console.log('[WEBHOOK] Received webhook request');
   console.log('[WEBHOOK] Number of events:', events.length);
@@ -1136,14 +1136,64 @@ app.post('/webhook', line.middleware(config), (req, res) => {
   // record the delivery as failed, and with redelivery enabled it would resend the
   // same event while the first run was still going. handleEvent is idempotent per
   // message ID, so a redelivery that does slip through is a no-op.
-  res.json({ success: true });
+  //
+  // Answering early is not free, though: Passenger reaps this process once no
+  // request is in flight, which killed image runs mid-OCR and lost the screenshot
+  // outright. So every image event is persisted to pending_events *before* the
+  // response — an INSERT fast enough to always beat the teardown — and the run
+  // itself becomes retryable work rather than something that must survive.
+  const queued = [];
+  const inline = [];
+  for (const event of events) {
+    const messageId = event.type === 'message' && event.message?.type === 'image'
+      ? event.message.id
+      : null;
+    if (!messageId) {
+      inline.push(event);
+      continue;
+    }
+    try {
+      const isNew = await db.enqueueEvent(messageId, event);
+      console.log(`[QUEUE] ${isNew ? 'Queued' : 'Already known'} image event ${messageId}`);
+      queued.push(messageId);
+    } catch (error) {
+      // A queue write failure must not drop the image — fall back to the old
+      // best-effort path, which at least works when the process is not reaped.
+      console.error('[QUEUE] Enqueue failed, processing inline instead:', error.message);
+      inline.push(event);
+    }
+  }
 
-  Promise.all(events.map(event =>
-    handleEvent(event).catch(err => {
+  res.json({ success: true, queued: queued.length });
+
+  // Best effort: when the process does survive, the image is done within seconds of
+  // being posted. When it does not, the queue row is still there for /process-queue.
+  const work = inline.map(event =>
+    handleEvent(event).catch(async err => {
       console.error('[ERROR] Unhandled error in handleEvent:', err);
+      // Only reachable for events the queue never took (non-image events, or an
+      // image whose enqueue failed). There is no retry behind this path, so the
+      // failure has to be written down here or it is gone.
+      if (event.message?.type === 'image') {
+        await saveDetectionLog({
+          timestamp: new Date().toISOString(),
+          messageId: event.message.id,
+          groupId: event.source?.groupId || null,
+          userId: event.source?.userId || null,
+          status: 'error',
+          reason: `Processing failed (not queued): ${err?.message || err}`
+        }).catch(logError => console.error('[ERROR] Could not write error log:', logError.message));
+      }
       return null;
     })
-  )).then(() => console.log('[WEBHOOK] Finished processing', events.length, 'event(s)'));
+  );
+  if (queued.length) {
+    work.push(drainQueue({ reason: 'webhook' }).catch(err => {
+      console.error('[QUEUE] Webhook drain failed:', err.message);
+      return null;
+    }));
+  }
+  Promise.all(work).then(() => console.log('[WEBHOOK] Finished processing', events.length, 'event(s)'));
 });
 
 // Add JSON parsing middleware for other endpoints (after LINE webhook)
@@ -1256,27 +1306,83 @@ async function handleEvent(event) {
 
       console.log('Detection result:', { isExcelScreenshot });
     } catch (error) {
+      // Silent mode towards the user, but the error must reach the caller: the
+      // queue can only retry what it is told failed. Swallowing it here would mark
+      // a LINE blob-download blip as finished work. The detection log for a run
+      // that never reaches a verdict is written once, by whoever gives up on it.
       console.error('Error processing image:', error);
-      // Silent mode: don't reply on errors — but record the failure so it
-      // surfaces on the web detection log instead of disappearing entirely.
-      try {
-        await saveDetectionLog({
-          timestamp: new Date().toISOString(),
-          messageId: message.id,
-          groupId: sourceInfo.groupId,
-          userId: sourceInfo.userId,
-          status: 'error',
-          reason: `Processing failed before detection: ${error?.message || error}`
-        });
-      } catch (logError) {
-        console.error('Failed to write error detection log:', logError);
-      }
+      throw error;
     }
   } else {
     console.log('Non-image message received:', message.type);
   }
 
   return null;
+}
+
+// An image event gets this many tries before it is buried as 'failed'. Generous
+// because most retries exist to recover from the process being reaped, not from
+// anything wrong with the image itself.
+const QUEUE_MAX_ATTEMPTS = 5;
+
+// One drain at a time per process — the webhook and a cron hit can easily overlap,
+// and both claiming at once would just fight over the same rows.
+let drainInFlight = null;
+
+// Work the queue. Callers that need the work to actually finish (the cron endpoint)
+// must await this *inside* their request: an in-flight request is the only thing
+// that stops Passenger from reaping the process mid-OCR.
+async function drainQueue({ reason = 'manual', limit = 3 } = {}) {
+  if (drainInFlight) {
+    console.log(`[QUEUE] Drain already in flight, joining it (${reason})`);
+    return drainInFlight;
+  }
+
+  drainInFlight = (async () => {
+    const claimToken = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const claimed = await db.claimPendingEvents(claimToken, { limit, maxAttempts: QUEUE_MAX_ATTEMPTS });
+
+    if (!claimed.length) {
+      console.log(`[QUEUE] Nothing to drain (${reason})`);
+      return { reason, claimed: 0, processed: 0, retrying: 0, failed: 0 };
+    }
+
+    console.log(`[QUEUE] Draining ${claimed.length} event(s) (${reason})`);
+    const summary = { reason, claimed: claimed.length, processed: 0, retrying: 0, failed: 0 };
+
+    for (const item of claimed) {
+      try {
+        await handleEvent(item.event);
+        await db.completeEvent(item.messageId);
+        summary.processed++;
+        console.log(`[QUEUE] Done: ${item.messageId} (attempt ${item.attempts})`);
+      } catch (error) {
+        const row = await db.releaseEvent(item.messageId, error.message, QUEUE_MAX_ATTEMPTS);
+        if (row?.status === 'failed') {
+          summary.failed++;
+          console.error(`[QUEUE] Giving up on ${item.messageId} after ${row.attempts} attempts: ${error.message}`);
+          // Bury it where the operators actually look. Without this, an image that
+          // exhausts its retries would go quiet again — the exact failure mode the
+          // queue exists to end.
+          await saveDetectionLog({
+            timestamp: new Date().toISOString(),
+            messageId: item.messageId,
+            groupId: item.event?.source?.groupId || null,
+            userId: item.event?.source?.userId || null,
+            status: 'error',
+            reason: `Gave up after ${row.attempts} attempts: ${error.message}`
+          }).catch(logError => console.error('[QUEUE] Could not log give-up:', logError.message));
+        } else {
+          summary.retrying++;
+          console.error(`[QUEUE] Retry queued for ${item.messageId} (attempt ${item.attempts}): ${error.message}`);
+        }
+      }
+    }
+
+    return summary;
+  })().finally(() => { drainInFlight = null; });
+
+  return drainInFlight;
 }
 
 async function getImageContent(messageId) {
@@ -3058,11 +3164,30 @@ async function runWatchdog({ dryRun = false } = {}) {
 //             let cron mail the failure instead.
 app.get('/watchdog', async (req, res) => {
   try {
+    // Drain first, and inside this request: an image still sitting in the queue is
+    // not a missing day, and awaiting it here is what holds the process open long
+    // enough for the OCR to finish.
+    const drained = await drainQueue({ reason: 'watchdog', limit: 5 })
+      .catch(error => ({ error: error.message }));
     const result = await runWatchdog({ dryRun: req.query.dry === '1' });
     const status = (req.query.strict === '1' && result.missing.length > 0) ? 409 : 200;
-    res.status(status).json({ success: true, ...result });
+    res.status(status).json({ success: true, queue: drained, ...result });
   } catch (error) {
     console.error('[WATCHDOG] Run failed:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Queue worker endpoint. Point a per-minute cron at this — it is what makes an
+// image survive the process being reaped mid-OCR. The work runs inside the request
+// on purpose: Passenger keeps a process alive exactly as long as it owes a response.
+app.get('/process-queue', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 3, 1), 10);
+    const result = await drainQueue({ reason: 'cron', limit });
+    res.json({ success: true, ...result, queue: await db.getQueueStats() });
+  } catch (error) {
+    console.error('[QUEUE] Drain endpoint failed:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -3072,9 +3197,26 @@ app.get('/watchdog', async (req, res) => {
 // total outage means no boot, and therefore no check.
 if (process.env.WATCHDOG_ON_BOOT?.toLowerCase() !== 'false') {
   setTimeout(() => {
-    runWatchdog().catch(error => console.error('[WATCHDOG] Boot run failed:', error.message));
+    // Queue first — the watchdog should not report a day missing while its image is
+    // still waiting to be processed. This run may be cut short by the process being
+    // reaped, which is fine: unfinished rows stay claimable.
+    drainQueue({ reason: 'boot' })
+      .catch(error => console.error('[QUEUE] Boot drain failed:', error.message))
+      .then(() => runWatchdog())
+      .catch(error => console.error('[WATCHDOG] Boot run failed:', error.message));
   }, 5000).unref?.();
 }
+
+// Passenger already restarts this process 35-50 times a day as a matter of course.
+// A stray rejection killing it on top of that is pure downtime, and the queue makes
+// a survivable process strictly better than a clean exit: staying up is what lets an
+// in-flight OCR finish. Both handlers log loudly so nothing fails silently.
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection (staying up):', reason?.stack || reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[FATAL] Uncaught exception (staying up):', error?.stack || error);
+});
 
 app.get('/health', async (req, res) => {
   const health = {
@@ -3088,6 +3230,9 @@ app.get('/health', async (req, res) => {
     const { date } = bangkokNow();
     const recent = await db.getRecordedDates(shiftDate(date, -14), date);
     health.lastRecordedDate = recent.length ? isoToThaiDisplay(recent[recent.length - 1]) : null;
+    // A growing queue means the drain cron is not running or not keeping up — the
+    // one symptom that would otherwise look identical to "no images were sent".
+    health.queue = await db.getQueueStats();
   } catch (error) {
     health.db = 'error';
     health.error = error.message;

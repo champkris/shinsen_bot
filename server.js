@@ -69,6 +69,14 @@ const ALERT_GROUP_IDS = process.env.ALERT_GROUP_IDS
   ? process.env.ALERT_GROUP_IDS.split(',').map(id => id.trim()).filter(id => id)
   : [];
 
+// LINE user IDs that receive developer-facing alerts — currently the reconciliation
+// warning raised when a column's per-CDC sum disagrees with the ยอดรวม printed on the
+// plan. These go to a person, not a group: the record is still saved and the customer
+// notification still goes out, so this must not become noise in a shared room.
+const DEV_ALERT_USER_IDS = process.env.DEV_ALERT_USER_IDS
+  ? process.env.DEV_ALERT_USER_IDS.split(',').map(id => id.trim()).filter(id => id)
+  : [];
+
 // How many days back the watchdog looks for missing data, and the hour (Bangkok time)
 // after which the current day is expected to have been reported.
 const WATCHDOG_LOOKBACK_DAYS = parseInt(process.env.WATCHDOG_LOOKBACK_DAYS || '7', 10);
@@ -80,6 +88,10 @@ console.log('[CONFIG] Auto-notify:', AUTO_NOTIFY);
 console.log('[CONFIG] Alert groups configured:', ALERT_GROUP_IDS.length);
 if (ALERT_GROUP_IDS.length === 0) {
   console.warn('[CONFIG] WARNING: ALERT_GROUP_IDS is empty — the missing-data watchdog will log but cannot notify anyone');
+}
+console.log('[CONFIG] Dev alert users configured:', DEV_ALERT_USER_IDS.length);
+if (DEV_ALERT_USER_IDS.length === 0) {
+  console.warn('[CONFIG] WARNING: DEV_ALERT_USER_IDS is empty — reconciliation mismatches will be logged but nobody is told');
 }
 
 // Test database connection on startup
@@ -184,6 +196,28 @@ async function sendAlertToGroups(text) {
       sent = true;
     } catch (error) {
       console.error(`[ALERT] Failed to send alert to group ${groupId}:`, error.message);
+    }
+  }
+  return sent;
+}
+
+// Push a developer-facing alert to a private LINE chat. Same never-throws contract as
+// sendAlertToGroups: this fires alongside a successful save, so a failed alert must not
+// turn a recorded day into a failed one.
+async function sendDevAlert(text) {
+  if (DEV_ALERT_USER_IDS.length === 0) {
+    console.warn('[DEV-ALERT] No dev users configured, alert not sent:', text.split('\n')[0]);
+    return false;
+  }
+
+  let sent = false;
+  for (const userId of DEV_ALERT_USER_IDS) {
+    try {
+      await client.pushMessage({ to: userId, messages: [{ type: 'text', text }] });
+      console.log(`[DEV-ALERT] Sent alert to user: ${userId}`);
+      sent = true;
+    } catch (error) {
+      console.error(`[DEV-ALERT] Failed to send alert to user ${userId}:`, error.message);
     }
   }
   return sent;
@@ -729,6 +763,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
   // Extract CDC values row by row, tracking individual contributions for ratio correction
   const CRATE_TOTAL_COL = lay.totalCratesCol; // ตะกร้า รวม (total crates) — right of the last product column
   const cdcRows = [];
+  const unknownVendors = [];
 
   table.forEach((row, rowIndex) => {
     if (!row || row.length < 2) return;
@@ -749,7 +784,21 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
         bestScore = cdcName.length;
       }
     }
-    if (!bestCdcName) return;
+    if (!bestCdcName) {
+      // CDC_NAMES is a fixed list of the eleven branches, and daily_records has a column
+      // per branch — so a row we cannot place has nowhere to go and is dropped. Dropping
+      // it silently is the problem: a branch added to the plan, or one whose Thai name
+      // OCR mangled, quietly subtracts its bottles from the day. Only vendor rows are
+      // worth reporting; header and spacer rows fail this match too and mean nothing.
+      if (/FC\d+/.test(c0)) {
+        const label = c0.replace(/\s+/g, ' ').trim();
+        if (!unknownVendors.includes(label)) {
+          unknownVendors.push(label);
+          console.warn(`[CDC] Unrecognized branch in row ${rowIndex}: "${label}" — its bottles are not counted in any CDC`);
+        }
+      }
+      return;
+    }
 
     const fullCdcName = CDC_NAME_MAPPING[bestCdcName];
     const value = getRowProductValue(row, columnIndex, rowIndex, table, totalsRowIndex, yodruamTotal, lay);
@@ -830,7 +879,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
     cdcTotals[entry.cdcName] += entry.value;
   }
 
-  return { cdcTotals, totalSum };
+  return { cdcTotals, totalSum, unknownVendors };
 }
 
 // Extract Khon Kaen Laos value for orange category
@@ -1008,6 +1057,8 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
 
   // Step 5: Extract data for each detected product
   const results = [];
+  const reconcileIssues = [];
+  const unknownBranches = new Set();
 
   // Crate columns are located from the table headers, so a plan with any number of juice
   // columns (added or removed) still finds ตะกร้า counts in the right place.
@@ -1028,7 +1079,8 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
 
     // Extract CDC totals, passing ยอดรวม for ratio-based correction of truncated values
     const yodruamValue = yodruamTotals[columnIndex] || 0;
-    const { cdcTotals, totalSum } = extractCDCTotals(table, columnIndex, yodruamValue, layout);
+    const { cdcTotals, totalSum, unknownVendors } = extractCDCTotals(table, columnIndex, yodruamValue, layout);
+    for (const v of unknownVendors) unknownBranches.add(v);
 
     // Use ยอดรวม from raw text as authoritative total when available
     let finalTotalSum = totalSum;
@@ -1045,6 +1097,23 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
     const productColumnIndices = Object.values(detectedProducts).map(p => p.column).sort((a, b) => a - b);
     const khonKaenLaosValue = category === 'orange' ? extractKhonKaenLaos(table, columnIndex, productColumnIndices) : 0;
 
+    // Reconcile against the ยอดรวม printed on the plan. That figure is an independent
+    // checksum the sheet hands us for free, and every per-CDC breakdown that came out
+    // right has matched it exactly (30/30 columns across 11 archived plans). A mismatch
+    // means the extraction went wrong somewhere — a merged cell read as one number, a
+    // ratio "fix" that appended a digit, a branch whose name OCR mangled — and without
+    // this check that lands in the dashboard looking like a normal day.
+    // The record is still saved: a number that is probably right beats a missing day,
+    // and the alert goes to a person who can compare it against the image.
+    const cdcSum = Object.values(cdcTotals).reduce((a, b) => a + b, 0);
+    if (finalTotalSum > 0 && cdcSum !== finalTotalSum) {
+      const diff = cdcSum - finalTotalSum;
+      console.warn(`[RECONCILE] ${category}: per-CDC sum ${cdcSum} != ยอดรวม ${finalTotalSum} (diff ${diff > 0 ? '+' : ''}${diff})`);
+      reconcileIssues.push({ category, cdcSum, expected: finalTotalSum, diff, cdcTotals });
+    } else {
+      console.log(`[RECONCILE] ${category}: per-CDC sum ${cdcSum} matches ยอดรวม ✓`);
+    }
+
     // Build record
     const dailyRecord = {
       date: dateStr,
@@ -1060,6 +1129,48 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
     await saveDailyRecord(dailyRecord, category);
     console.log(`Recorded daily data for ${dateStr} in ${category} category (column ${columnIndex})`);
     results.push({ category, record: dailyRecord });
+  }
+
+  // Raised after saving, and deliberately not awaited into the success/failure result:
+  // the day is recorded either way, this only tells a human to go look at the image.
+  // An unplaceable branch is worth its own alert even when the totals happen to add up,
+  // because the fix is a code change (add it to CDC_NAMES and daily_records), not a
+  // re-scan of the image.
+  if (reconcileIssues.length > 0 || unknownBranches.size > 0) {
+    const sections = [];
+
+    if (unknownBranches.size > 0) {
+      sections.push(
+        `[สาขาที่ระบบไม่รู้จัก]\n`
+        + [...unknownBranches].map(v => `  ${v}`).join('\n')
+        + `\n  ← ขวดของแถวนี้ไม่ถูกนับในสาขาใดเลย ต้องเพิ่มสาขาในโค้ด`
+      );
+    }
+
+    for (const i of reconcileIssues) {
+      const breakdown = Object.entries(i.cdcTotals)
+        .filter(([, v]) => v > 0)
+        .map(([name, v]) => `  ${name}: ${v.toLocaleString()}`)
+        .join('\n');
+      sections.push(
+        `[${db.CATEGORY_NAMES[i.category] || i.category}]\n`
+        + `รวมรายสาขา: ${i.cdcSum.toLocaleString()}\n`
+        + `ยอดรวมในภาพ: ${i.expected.toLocaleString()}\n`
+        + `ต่างกัน: ${i.diff > 0 ? '+' : ''}${i.diff.toLocaleString()}\n`
+        + breakdown
+      );
+    }
+
+    const headline = reconcileIssues.length > 0
+      ? '⚠️ OCR ไม่ตรงยอดรวม'
+      : '⚠️ OCR เจอสาขาที่ไม่รู้จัก';
+
+    await sendDevAlert(
+      `${headline} — ${dateStr}\n\n`
+      + `บันทึกลงฐานข้อมูลแล้ว แต่ตัวเลขอาจผิด กรุณาเทียบกับภาพต้นฉบับ\n\n`
+      + sections.join('\n\n')
+      + `\n\nhttps://shinsen.yushi-marketing.com/daily-report`
+    );
   }
 
   if (results.length === 0) {
@@ -1114,14 +1225,26 @@ function buildTablesFromResult(result) {
       // Left whole, parseOCRNumber strips the space and reads 293, the bottle/crate
       // ratio then looks impossible, and the ratio-fix below "restores" a digit that
       // was never dropped (1,012 → 10,120). Hand each spanned row its own value.
+      //
+      // Each spanned row contributes at most one line to the cell, so N numbers means
+      // N of those rows had a value and concatenating them is always wrong. One number
+      // fewer than rowSpan just means a row was blank; the values still belong to the
+      // rows from the top down, and even a wrong guess about which row beats reading
+      // 29 and 3 as 293. More numbers than rows is the opposite situation — one value
+      // that OCR split on a space ("8 566") — so that one is left alone to be rejoined.
       if (colIdx > 0 && rowSpan > 1) {
-        const numParts = content.trim().split(/\s+/);
-        if (numParts.length === rowSpan && numParts.every(p => /^[\d.,]+$/.test(p))) {
-          for (let i = 0; i < rowSpan && tableRows[rowIdx + i]; i++) {
+        const numParts = content.trim().split(/\s+/).filter(Boolean);
+        const allNumeric = numParts.length > 1 && numParts.every(p => /^[\d.,]+$/.test(p));
+        if (allNumeric && numParts.length <= rowSpan) {
+          for (let i = 0; i < numParts.length && tableRows[rowIdx + i]; i++) {
             tableRows[rowIdx + i][colIdx] = numParts[i];
           }
-          console.log(`[PREPROCESS] Split merged numeric cell at row ${rowIdx} col ${colIdx} across ${rowSpan} rows: [${numParts.join(' | ')}]`);
+          const how = numParts.length === rowSpan ? 'across' : `over the first ${numParts.length} of`;
+          console.log(`[PREPROCESS] Split merged numeric cell at row ${rowIdx} col ${colIdx} ${how} ${rowSpan} rows: [${numParts.join(' | ')}]`);
           continue;
+        }
+        if (allNumeric) {
+          console.warn(`[PREPROCESS] Merged cell at row ${rowIdx} col ${colIdx} holds ${numParts.length} numbers over only ${rowSpan} rows ("${content}") — leaving it for parseOCRNumber to rejoin`);
         }
       }
 

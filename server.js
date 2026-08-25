@@ -400,6 +400,10 @@ const CDC_NAMES = [
   'ขอนแก่น'
 ];
 
+// The คลังส่งสินค้า (C1) that ships nearly every vendor on the plan. validateTableData
+// uses it as the "is this sheet actually filled in?" probe.
+const BANGBUATHONG_WAREHOUSE = 'บางบัวทอง';
+
 // Map short names to full names for consistency
 const CDC_NAME_MAPPING = {
   'บางบัวทอง': 'คลังบางบัวทอง',
@@ -554,8 +558,17 @@ function validateTableData(table, detectedProducts) {
 
   let hadyaiSum = 0;
   let phuketSum = 0;
-  const zeroCells = [];
   const layout = deriveLayout(productColumns, table);
+
+  // An unfinished plan sheet shows up as the บางบัวทอง dispatch block sitting at 0 for
+  // every juice — that block is the bulk of the sheet and is never legitimately empty on
+  // a real shipping day. A single juice reading 0 while another juice on the same rows
+  // carries real counts is normal (some days ship no น้ำสับปะรด at all), so only an
+  // all-juice zero counts as "not filled in yet".
+  // layout.productCols spans every column between the warehouse and the crate columns, so
+  // a juice added to the sheet later is covered without touching this code.
+  let bbtRows = 0;
+  const bbtSums = new Map(layout.productCols.map(c => [c, 0]));
 
   // Check all detected product columns for validation
   table.forEach((row, rowIndex) => {
@@ -563,10 +576,10 @@ function validateTableData(table, detectedProducts) {
 
     const c0Cell = row[0] ? row[0].toString().trim() : '';
     const isVendorRow = /FC\d+/.test(c0Cell);
+    const warehouse = row[1] ? row[1].toString() : '';
 
     // Sum values from all product columns for validation
     productColumns.forEach(colIdx => {
-      const rawCell = row[colIdx] != null ? row[colIdx].toString().trim() : '';
       const value = getRowProductValue(row, colIdx, rowIndex, null, -1, 0, layout);
 
       if (c0Cell.includes('FC33') && c0Cell.includes('หาดใหญ่')) {
@@ -575,26 +588,31 @@ function validateTableData(table, detectedProducts) {
       if (c0Cell.includes('FC07')) {
         phuketSum += value;
       }
-
-      // Reject if a vendor row has an explicit "0" in a bottle-count column.
-      // Empty/blank cells from merged rows are ignored (no digits).
-      if (isVendorRow && rawCell !== '' && /[0-9]/.test(rawCell) && value === 0) {
-        zeroCells.push({ vendor: c0Cell.replace(/\s+/g, ' '), column: colIdx, rowIndex });
-      }
     });
+
+    if (isVendorRow && warehouse.includes(BANGBUATHONG_WAREHOUSE)) {
+      bbtRows++;
+      for (const colIdx of layout.productCols) {
+        bbtSums.set(colIdx, bbtSums.get(colIdx) + getRowProductValue(row, colIdx, rowIndex, null, -1, 0, layout));
+      }
+    }
   });
 
   console.log(`[VALIDATION] FC33 หาดใหญ่ sum: ${hadyaiSum}, FC07 ภูเก็ต sum: ${phuketSum}`);
 
-  if (zeroCells.length > 0) {
-    const preview = zeroCells.slice(0, 5).map(z => `${z.vendor}@col${z.column}`).join(', ');
-    console.log(`[VALIDATION] Found ${zeroCells.length} zero value(s) in bottle-count columns: ${preview}`);
-    return {
-      valid: false,
-      reason: `Found ${zeroCells.length} zero value(s) in bottle-count columns (e.g., ${preview}). Waiting for all bottle counts to be non-zero before recording.`,
-      hadyaiSum,
-      phuketSum
-    };
+  // Skipped when no บางบัวทอง row matched at all: that means OCR garbled the warehouse
+  // name, not that the block is empty, and rejecting on it would throw away a good plan.
+  if (bbtRows > 0) {
+    const perCol = [...bbtSums.entries()].map(([c, v]) => `col${c}=${v}`).join(', ');
+    console.log(`[VALIDATION] คลังส่งสินค้าบางบัวทอง (${bbtRows} vendor rows): ${perCol}`);
+    if ([...bbtSums.values()].every(v => v === 0)) {
+      return {
+        valid: false,
+        reason: `คลังส่งสินค้าบางบัวทอง is 0 across all ${bbtSums.size} juice column(s) over ${bbtRows} vendor row(s) — plan not filled in yet.`,
+        hadyaiSum,
+        phuketSum
+      };
+    }
   }
 
   if (hadyaiSum === 0 && phuketSum === 0) {
@@ -3830,6 +3848,7 @@ if (process.env.NODE_ENV !== 'test') {
 module.exports = {
   getRowProductValue,
   detectProductColumns,
+  validateTableData,
   detectCrateColumns,
   deriveLayout,
   extractCDCTotals,

@@ -787,7 +787,7 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
 
       const original = entry.value;
       entry.value = candidates[0]; // provisional: smallest in-range value
-      corrected.push({ entry, candidates });
+      corrected.push({ entry, candidates, original });
       console.log(`[RATIO-FIX] Row ${entry.rowIndex} (${entry.cdcName}): ${original} → ${entry.value} (ratio ${(original / entry.crateTotal).toFixed(1)} → ${(entry.value / entry.crateTotal).toFixed(1)}, crates=${entry.crateTotal}, candidates=[${candidates.join(',')}])`);
     }
 
@@ -811,7 +811,16 @@ function extractCDCTotals(table, columnIndex, yodruamTotal = 0, layout = null) {
     }
 
     const correctedSum = cdcRows.reduce((s, r) => s + r.value, 0);
-    if (correctedSum !== rawSum) {
+
+    // The whole premise of this pass is that a digit was dropped, so a correct fix always
+    // moves the column *toward* ยอดรวม. Landing further away means the ratio was wrong for
+    // some other reason — a merged crate cell, a misread crate count — and appending a
+    // digit turned a good value into one 10x too large. Throw the pass away rather than
+    // record that.
+    if (Math.abs(targetTotal - correctedSum) > Math.abs(targetTotal - rawSum)) {
+      for (const c of corrected) c.entry.value = c.original;
+      console.log(`[RATIO-FIX] Reverted: ${rawSum} → ${correctedSum} moved away from ยอดรวม=${targetTotal}; keeping the raw values`);
+    } else if (correctedSum !== rawSum) {
       console.log(`[RATIO-FIX] Corrected: ${rawSum} → ${correctedSum} (ยอดรวม=${targetTotal}, remaining diff=${targetTotal - correctedSum})`);
     }
   }
@@ -1058,6 +1067,71 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
   }
 
   return { success: true, date: dateStr, results: results };
+}
+
+// Turn Azure's flat cell list into row arrays. Split out of performOCR so the merged-cell
+// handling can be exercised offline against a saved Azure response.
+function buildTablesFromResult(result) {
+  const tableData = [];
+  if (!result || !result.tables) return tableData;
+
+  for (const table of result.tables) {
+    const tableRows = [];
+    const maxRow = Math.max(...table.cells.map(c => c.rowIndex)) + 1;
+    const maxCol = Math.max(...table.cells.map(c => c.columnIndex)) + 1;
+
+    for (let i = 0; i < maxRow; i++) {
+      tableRows[i] = new Array(maxCol).fill('');
+    }
+
+    for (const cell of table.cells) {
+      const content = cell.content || '';
+      const rowIdx = cell.rowIndex;
+      const colIdx = cell.columnIndex;
+      const rowSpan = cell.rowSpan || 1;
+
+      // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
+      // a single multi-row cell. Split the content by FC code so fill-down later
+      // gives each row exactly one vendor instead of leaving both names in every row.
+      if (colIdx === 0 && rowSpan > 1) {
+        const fcParts = content
+          .split(/(?=FC\d+)/)
+          .map(p => p.trim())
+          .filter(p => /^FC\d+/.test(p));
+        if (fcParts.length > 1) {
+          const K = fcParts.length;
+          for (let i = 0; i < rowSpan; i++) {
+            const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
+            tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
+          }
+          console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
+          continue;
+        }
+      }
+
+      // Azure does the same to a stack of *numeric* cells, joining the values with a
+      // space — ตะกร้ารวม 29 above 3 arrives as one rowSpan-2 cell reading "29 3".
+      // Left whole, parseOCRNumber strips the space and reads 293, the bottle/crate
+      // ratio then looks impossible, and the ratio-fix below "restores" a digit that
+      // was never dropped (1,012 → 10,120). Hand each spanned row its own value.
+      if (colIdx > 0 && rowSpan > 1) {
+        const numParts = content.trim().split(/\s+/);
+        if (numParts.length === rowSpan && numParts.every(p => /^[\d.,]+$/.test(p))) {
+          for (let i = 0; i < rowSpan && tableRows[rowIdx + i]; i++) {
+            tableRows[rowIdx + i][colIdx] = numParts[i];
+          }
+          console.log(`[PREPROCESS] Split merged numeric cell at row ${rowIdx} col ${colIdx} across ${rowSpan} rows: [${numParts.join(' | ')}]`);
+          continue;
+        }
+      }
+
+      tableRows[rowIdx][colIdx] = content;
+    }
+
+    tableData.push(tableRows);
+  }
+
+  return tableData;
 }
 
 // Preprocess table data: fill down C0 and C1 values to handle merged cells
@@ -1475,47 +1549,7 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
       }
     }
 
-    if (result.tables) {
-      for (const table of result.tables) {
-        const tableRows = [];
-        const maxRow = Math.max(...table.cells.map(c => c.rowIndex)) + 1;
-        const maxCol = Math.max(...table.cells.map(c => c.columnIndex)) + 1;
-
-        for (let i = 0; i < maxRow; i++) {
-          tableRows[i] = new Array(maxCol).fill('');
-        }
-
-        for (const cell of table.cells) {
-          const content = cell.content || '';
-          const rowIdx = cell.rowIndex;
-          const colIdx = cell.columnIndex;
-          const rowSpan = cell.rowSpan || 1;
-
-          // Azure occasionally merges adjacent Vendor cells (e.g., FC03 + FC15) into
-          // a single multi-row cell. Split the content by FC code so fill-down later
-          // gives each row exactly one vendor instead of leaving both names in every row.
-          if (colIdx === 0 && rowSpan > 1) {
-            const fcParts = content
-              .split(/(?=FC\d+)/)
-              .map(p => p.trim())
-              .filter(p => /^FC\d+/.test(p));
-            if (fcParts.length > 1) {
-              const K = fcParts.length;
-              for (let i = 0; i < rowSpan; i++) {
-                const fcIdx = Math.min(K - 1, Math.floor((i * K) / rowSpan));
-                tableRows[rowIdx + i][colIdx] = fcParts[fcIdx];
-              }
-              console.log(`[PREPROCESS] Split merged Vendor cell at row ${rowIdx} into ${K} FCs across ${rowSpan} rows: [${fcParts.join(' | ')}]`);
-              continue;
-            }
-          }
-
-          tableRows[rowIdx][colIdx] = content;
-        }
-
-        tableData.push(tableRows);
-      }
-    }
+    tableData = buildTablesFromResult(result);
 
     // Preprocess table data: fill down C0 and C1 to help with extraction
     if (tableData && tableData.length > 0) {
@@ -3848,6 +3882,7 @@ if (process.env.NODE_ENV !== 'test') {
 module.exports = {
   getRowProductValue,
   detectProductColumns,
+  buildTablesFromResult,
   validateTableData,
   detectCrateColumns,
   deriveLayout,

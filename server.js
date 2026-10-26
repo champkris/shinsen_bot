@@ -261,6 +261,10 @@ const PRODUCT_DETECTION = {
   pineapple: {
     keywords: ['สับปะรด', 'pineapple'],
     dbCategory: 'pineapple'
+  },
+  watermelon: {
+    keywords: ['แตงโม', 'watermelon'],
+    dbCategory: 'watermelon'
   }
 };
 
@@ -528,7 +532,7 @@ function detectProductColumns(table) {
   }
 
   // Fallback: recover orange when Azure OCR garbles "ส้ม" (observed: "ẫu", "ลม", etc.).
-  // Plan ส่งสินค้า has a fixed column order — orange sits immediately left of pop/pineapple,
+  // Plan ส่งสินค้า has a fixed column order — orange sits immediately left of pop/pineapple/watermelon,
   // and every product column shares the "จำนวน น้ำ ___ (ขวด)" header pattern.
   detectOrangeByPosition(table, detectedProducts);
 
@@ -2096,7 +2100,8 @@ app.get('/daily-report', async (req, res) => {
       pop: { records: records.pop || [], name: 'Shinsen Pop', thaiName: 'Shinsen Pop', icon: '🍹', bgColor: '#e1f5fe', borderColor: '#03a9f4' },
       mixed: { records: records.mixed || [], name: 'Mixed Fruit', thaiName: 'น้ำผลไม้รวม', icon: '🍇', bgColor: '#f3e5f5', borderColor: '#9c27b0' },
       tomato: { records: records.tomato || [], name: 'Tomato Yuzu', thaiName: 'Tomato Yuzu', icon: '🍅', bgColor: '#ffebee', borderColor: '#f44336' },
-      pineapple: { records: records.pineapple || [], name: 'Pineapple', thaiName: 'น้ำสับปะรด', icon: '🍍', bgColor: '#f9fbe7', borderColor: '#cddc39' }
+      pineapple: { records: records.pineapple || [], name: 'Pineapple', thaiName: 'น้ำสับปะรด', icon: '🍍', bgColor: '#f9fbe7', borderColor: '#cddc39' },
+      watermelon: { records: records.watermelon || [], name: 'Watermelon', thaiName: 'น้ำแตงโม', icon: '🍉', bgColor: '#fce4ec', borderColor: '#e57373' }
     };
 
     // Generate tables for each category
@@ -2668,8 +2673,8 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅', pineapple: '🍍' };
-const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336', pineapple: '#cddc39' };
+const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅', pineapple: '🍍', watermelon: '🍉' };
+const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336', pineapple: '#cddc39', watermelon: '#e57373' };
 
 // Pick progress-bar color based on achievement % (Volume vs Target).
 function progressBarColor(pct) {

@@ -86,7 +86,7 @@ function toDisplayDate(mysqlDate) {
 }
 
 // All supported product categories
-const CATEGORIES = ['orange', 'yuzu', 'pop', 'mixed', 'tomato', 'pineapple'];
+const CATEGORIES = ['orange', 'yuzu', 'pop', 'mixed', 'tomato', 'pineapple', 'watermelon'];
 
 // Category display names (Thai)
 const CATEGORY_NAMES = {
@@ -95,8 +95,32 @@ const CATEGORY_NAMES = {
   pop: 'Shinsen Pop',
   mixed: 'น้ำผลไม้รวม',
   tomato: 'Tomato Yuzu',
-  pineapple: 'น้ำสับปะรด'
+  pineapple: 'น้ำสับปะรด',
+  watermelon: 'น้ำแตงโม'
 };
+
+// daily_records.category is an ENUM, so a category added to CATEGORIES is rejected by
+// MySQL until the column learns it. Widened on boot for the same reason pending_events is
+// created on boot: a deploy has no shell step, so a hand-run ALTER is one that gets skipped.
+// Checked against information_schema first so the ALTER only runs once, not on every boot.
+const categoryEnumReady = pool.query(
+  `SELECT COLUMN_TYPE AS type FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_records' AND COLUMN_NAME = 'category'`
+)
+  .then(async ([rows]) => {
+    if (!rows.length) return false;
+    const type = String(rows[0].type);
+    const missing = CATEGORIES.filter(c => !type.includes(`'${c}'`));
+    if (!missing.length) return true;
+    const enumList = CATEGORIES.map(c => `'${c}'`).join(', ');
+    await pool.query(`ALTER TABLE daily_records MODIFY category ENUM(${enumList}) NOT NULL`);
+    console.log(`[DB] daily_records.category ENUM extended with: ${missing.join(', ')}`);
+    return true;
+  })
+  .catch(error => {
+    console.error('[DB] Could not ensure daily_records.category ENUM:', error.message);
+    return false;
+  });
 
 // Convert record from database format to application format
 function dbToAppRecord(row) {
@@ -170,6 +194,7 @@ async function isDateRecorded(date, category) {
 
 // Save a daily record (insert or update)
 async function saveDailyRecord(record, category) {
+  await categoryEnumReady;
   const dbRecord = appToDbRecord(record, category);
 
   const columns = Object.keys(dbRecord);

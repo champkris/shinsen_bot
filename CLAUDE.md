@@ -49,7 +49,7 @@ Database abstraction layer:
 ### Key Concepts
 
 - **CDC**: Warehouse/distribution center locations across Thailand (11 locations). Mapped between Thai short names (e.g., `บางบัวทอง`) and database columns (e.g., `cdc_bangbuathong`)
-- **Categories**: 5 product types — orange, yuzu, pop (Shinsen Pop), mixed (น้ำผลไม้รวม), tomato (Tomato Yuzu)
+- **Categories**: 7 product types — orange, yuzu, pop (Shinsen Pop), mixed (น้ำผลไม้รวม), tomato (Tomato Yuzu), pineapple (น้ำสับปะรด), watermelon (น้ำแตงโม)
 - **Dynamic product detection**: Product columns are identified from Excel header rows using keyword matching, not hardcoded positions
 - **Totals row exclusion**: The totals row at the bottom of tables is excluded from CDC calculations to avoid double-counting
 - **Missing-data watchdog**: A webhook LINE never delivers leaves no trace in this app — no log, no `detection_logs` row — so a whole day can go missing silently. `runWatchdog()` checks `daily_records` for expected days instead of trusting the delivery path, and alerts `ALERT_GROUP_IDS` once per missing date (dedup via the `watchdog_alerts` table). It runs on boot and via `GET /watchdog`; an external scheduler is still required, since a total outage means the app never boots

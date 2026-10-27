@@ -76,6 +76,63 @@ CREATE TABLE IF NOT EXISTS pending_events (
   INDEX idx_status_created (status, created_at)
 );
 
+-- Table: product_categories
+-- Juices added automatically when a plan carried a column no keyword matched (or named on
+-- the juice page). Merged into the built-in categories at runtime; keywords is a JSON
+-- array matched against headers.
+CREATE TABLE IF NOT EXISTS product_categories (
+  category VARCHAR(50) NOT NULL PRIMARY KEY,
+  thai_name VARCHAR(100) NOT NULL,
+  english_name VARCHAR(100) DEFAULT NULL,
+  color VARCHAR(7) DEFAULT NULL,
+  icon VARCHAR(16) DEFAULT NULL,
+  keywords TEXT NOT NULL,
+  created_by VARCHAR(64) DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) DEFAULT CHARSET=utf8mb4;
+
+-- Table: pending_juices
+-- Every juice column found on a plan with no matching keyword. Auto-added ones are kept
+-- as history (status 'added'); one whose name couldn't be read waits as 'pending' until
+-- it is named or ignored on the juice page. context_json keeps the OCR table so it is
+-- recorded then without resending the image.
+CREATE TABLE IF NOT EXISTS pending_juices (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  plan_date DATE NOT NULL,
+  header VARCHAR(255) NOT NULL,
+  keyword VARCHAR(100) NOT NULL,
+  english_name VARCHAR(100) DEFAULT NULL,
+  color VARCHAR(7) DEFAULT NULL,
+  total INT NOT NULL DEFAULT 0,
+  context_json MEDIUMTEXT NOT NULL,
+  status ENUM('pending', 'added', 'ignored') NOT NULL DEFAULT 'pending',
+  category VARCHAR(50) DEFAULT NULL,
+  resolved_by VARCHAR(64) DEFAULT NULL,
+  resolved_at DATETIME DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_plan_keyword (plan_date, keyword)
+) DEFAULT CHARSET=utf8mb4;
+
+-- Table: juice_display
+-- Display settings for the built-in juices, set on the juice page: a name, English name,
+-- colour or icon here replaces the one in code (NULL keeps it). Keywords are not affected.
+CREATE TABLE IF NOT EXISTS juice_display (
+  category VARCHAR(50) NOT NULL PRIMARY KEY,
+  thai_name VARCHAR(100) DEFAULT NULL,
+  english_name VARCHAR(100) DEFAULT NULL,
+  color VARCHAR(7) DEFAULT NULL,
+  icon VARCHAR(16) DEFAULT NULL
+) DEFAULT CHARSET=utf8mb4;
+
+-- Table: juice_aliases
+-- Extra spellings left by the juice page: merging a duplicate juice points its keywords at
+-- the juice it was merged into; deleting a juice points them at NULL, so a column with
+-- that name is never auto-added again.
+CREATE TABLE IF NOT EXISTS juice_aliases (
+  keyword VARCHAR(100) NOT NULL PRIMARY KEY,
+  category VARCHAR(50) DEFAULT NULL
+) DEFAULT CHARSET=utf8mb4;
+
 -- Table: detection_logs
 -- Stores logs from image detection attempts
 CREATE TABLE IF NOT EXISTS detection_logs (

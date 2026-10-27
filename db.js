@@ -99,28 +99,384 @@ const CATEGORY_NAMES = {
   watermelon: 'น้ำแตงโม'
 };
 
+// Built-in juices as shipped, before anything set on the juice page is applied.
+const BUILTIN_CATEGORIES = [...CATEGORIES];
+const BUILTIN_CATEGORY_NAMES = { ...CATEGORY_NAMES };
+const BUILTIN_ENGLISH_NAMES = {
+  orange: 'Orange',
+  yuzu: 'Yuzu',
+  pop: 'Shinsen Pop',
+  mixed: 'Mixed Fruit',
+  tomato: 'Tomato Yuzu',
+  pineapple: 'Pineapple',
+  watermelon: 'Watermelon'
+};
+
+// Juices the bot added on its own when a plan carried a column no keyword matched. Built-in
+// juices keep their keywords in server.js PRODUCT_DETECTION; these live in product_categories
+// and refreshCategories merges them into CATEGORIES / CATEGORY_NAMES in place.
+const CUSTOM_KEYWORDS = {};        // category → detection keywords
+
+// Display values from the DB, for every juice: an auto-added juice's own (English name
+// machine-translated, colour read off its plan column), or what was set for a built-in one on
+// the juice page (juice_display). A built-in juice with nothing set keeps the look in code.
+const CATEGORY_ENGLISH_NAMES = { ...BUILTIN_ENGLISH_NAMES };
+const JUICE_COLORS = {};           // category → dashboard colour
+const JUICE_ICONS = {};            // category → emoji
+const DISPLAY_OVERRIDES = {};      // built-in category → its juice_display row
+
+// Extra spellings left by merging one juice into another on the juice page: keyword → the
+// category it now detects as, or null for a keyword whose juice was deleted (never re-added).
+const JUICE_ALIASES = {};
+
+// Created on boot like pending_events, for the same no-shell-deploy reason.
+// pending_juices keeps every unknown juice column seen, with the OCR table and layout in
+// context_json: an auto-added one keeps it as history, and one whose name couldn't be read
+// waits there (status 'pending') until it is named on the juice page and recorded from it —
+// nobody has to find and resend the image.
+const JUICE_TABLES_DDL = [
+  `CREATE TABLE IF NOT EXISTS product_categories (
+    category VARCHAR(50) NOT NULL PRIMARY KEY,
+    thai_name VARCHAR(100) NOT NULL,
+    english_name VARCHAR(100) DEFAULT NULL,
+    color VARCHAR(7) DEFAULT NULL,
+    icon VARCHAR(16) DEFAULT NULL,
+    keywords TEXT NOT NULL,
+    created_by VARCHAR(64) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  ) DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS pending_juices (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    plan_date DATE NOT NULL,
+    header VARCHAR(255) NOT NULL,
+    keyword VARCHAR(100) NOT NULL,
+    english_name VARCHAR(100) DEFAULT NULL,
+    color VARCHAR(7) DEFAULT NULL,
+    total INT NOT NULL DEFAULT 0,
+    context_json MEDIUMTEXT NOT NULL,
+    status ENUM('pending', 'added', 'ignored') NOT NULL DEFAULT 'pending',
+    category VARCHAR(50) DEFAULT NULL,
+    resolved_by VARCHAR(64) DEFAULT NULL,
+    resolved_at DATETIME DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_plan_keyword (plan_date, keyword)
+  ) DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS juice_aliases (
+    keyword VARCHAR(100) NOT NULL PRIMARY KEY,
+    category VARCHAR(50) DEFAULT NULL
+  ) DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS juice_display (
+    category VARCHAR(50) NOT NULL PRIMARY KEY,
+    thai_name VARCHAR(100) DEFAULT NULL,
+    english_name VARCHAR(100) DEFAULT NULL,
+    color VARCHAR(7) DEFAULT NULL,
+    icon VARCHAR(16) DEFAULT NULL
+  ) DEFAULT CHARSET=utf8mb4`
+];
+
+// Load auto-added juices into CATEGORIES / CATEGORY_NAMES in place, so every existing reader
+// (dashboards, notifications, record loaders) sees them without a code change — and drop
+// ones merged away or deleted since, possibly by another process. Cheap enough per request.
+async function refreshCategories() {
+  const [rows] = await pool.query(
+    'SELECT category, thai_name, english_name, color, icon, keywords FROM product_categories ORDER BY created_at, category'
+  );
+  const [aliases] = await pool.query('SELECT keyword, category FROM juice_aliases');
+  const [display] = await pool.query('SELECT * FROM juice_display');
+
+  const live = new Set(rows.map(r => r.category));
+  for (const category of Object.keys(CUSTOM_KEYWORDS)) {
+    if (live.has(category)) continue;
+    const i = CATEGORIES.indexOf(category);
+    if (i >= 0) CATEGORIES.splice(i, 1);
+    delete CATEGORY_NAMES[category];
+    delete CUSTOM_KEYWORDS[category];
+    delete CATEGORY_ENGLISH_NAMES[category];
+    delete JUICE_COLORS[category];
+    delete JUICE_ICONS[category];
+  }
+
+  for (const row of rows) {
+    if (!CATEGORIES.includes(row.category)) CATEGORIES.push(row.category);
+    CATEGORY_NAMES[row.category] = row.thai_name;
+    if (row.english_name) CATEGORY_ENGLISH_NAMES[row.category] = row.english_name;
+    else delete CATEGORY_ENGLISH_NAMES[row.category];
+    if (row.color) JUICE_COLORS[row.category] = row.color;
+    else delete JUICE_COLORS[row.category];
+    if (row.icon) JUICE_ICONS[row.category] = row.icon;
+    else delete JUICE_ICONS[row.category];
+    try {
+      CUSTOM_KEYWORDS[row.category] = JSON.parse(row.keywords);
+    } catch {
+      CUSTOM_KEYWORDS[row.category] = [];
+    }
+  }
+
+  for (const keyword of Object.keys(JUICE_ALIASES)) delete JUICE_ALIASES[keyword];
+  for (const a of aliases) JUICE_ALIASES[a.keyword] = a.category;
+
+  // Built-in juices: what was set on the juice page, else the look they ship with.
+  for (const category of Object.keys(DISPLAY_OVERRIDES)) delete DISPLAY_OVERRIDES[category];
+  for (const row of display) if (BUILTIN_CATEGORIES.includes(row.category)) DISPLAY_OVERRIDES[row.category] = row;
+  for (const category of BUILTIN_CATEGORIES) {
+    const o = DISPLAY_OVERRIDES[category] || {};
+    CATEGORY_NAMES[category] = o.thai_name || BUILTIN_CATEGORY_NAMES[category];
+    CATEGORY_ENGLISH_NAMES[category] = o.english_name || BUILTIN_ENGLISH_NAMES[category];
+    if (o.color) JUICE_COLORS[category] = o.color;
+    else delete JUICE_COLORS[category];
+    if (o.icon) JUICE_ICONS[category] = o.icon;
+    else delete JUICE_ICONS[category];
+  }
+  return rows.length;
+}
+
 // daily_records.category is an ENUM, so a category added to CATEGORIES is rejected by
 // MySQL until the column learns it. Widened on boot for the same reason pending_events is
 // created on boot: a deploy has no shell step, so a hand-run ALTER is one that gets skipped.
-// Checked against information_schema first so the ALTER only runs once, not on every boot.
-const categoryEnumReady = pool.query(
-  `SELECT COLUMN_TYPE AS type FROM information_schema.COLUMNS
-   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_records' AND COLUMN_NAME = 'category'`
-)
-  .then(async ([rows]) => {
-    if (!rows.length) return false;
-    const type = String(rows[0].type);
-    const missing = CATEGORIES.filter(c => !type.includes(`'${c}'`));
-    if (!missing.length) return true;
-    const enumList = CATEGORIES.map(c => `'${c}'`).join(', ');
-    await pool.query(`ALTER TABLE daily_records MODIFY category ENUM(${enumList}) NOT NULL`);
-    console.log(`[DB] daily_records.category ENUM extended with: ${missing.join(', ')}`);
-    return true;
-  })
-  .catch(error => {
+// Checked against information_schema first so the ALTER only runs when something is missing.
+// Throws on failure: a caller adding a juice must not record it into a column that refuses it.
+async function ensureCategoryEnum(categories = CATEGORIES) {
+  const [rows] = await pool.query(
+    `SELECT COLUMN_TYPE AS type FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'daily_records' AND COLUMN_NAME = 'category'`
+  );
+  if (!rows.length) return false;
+  const type = String(rows[0].type);
+  const missing = categories.filter(c => !type.includes(`'${c}'`));
+  if (!missing.length) return true;
+  // Keep any value already in the column, even one no longer in CATEGORIES — dropping it
+  // would fail the ALTER (or blank the rows) for data recorded under it.
+  const existing = [...type.matchAll(/'((?:[^']|'')*)'/g)].map(m => m[1].replace(/''/g, "'"));
+  const enumList = [...new Set([...existing, ...categories])].map(c => pool.escape(c)).join(', ');
+  await pool.query(`ALTER TABLE daily_records MODIFY category ENUM(${enumList}) NOT NULL`);
+  console.log(`[DB] daily_records.category ENUM extended with: ${missing.join(', ')}`);
+  return true;
+}
+
+const categoryEnumReady = (async () => {
+  try {
+    for (const ddl of JUICE_TABLES_DDL) await pool.query(ddl);
+    const custom = await refreshCategories();
+    if (custom) console.log(`[DB] Loaded ${custom} auto-added juice(s)`);
+  } catch (error) {
+    // Built-in juices still work without these tables; only auto-adding new juices is lost.
+    console.error('[DB] Could not load auto-added juices:', error.message);
+  }
+  try {
+    return await ensureCategoryEnum();
+  } catch (error) {
     console.error('[DB] Could not ensure daily_records.category ENUM:', error.message);
     return false;
-  });
+  }
+})();
+
+function pendingJuiceFromRow(row) {
+  return {
+    id: row.id,
+    date: toDisplayDate(row.plan_date),
+    header: row.header,
+    keyword: row.keyword,
+    englishName: row.english_name,
+    color: row.color,
+    total: row.total,
+    status: row.status,
+    category: row.category,
+    context: JSON.parse(row.context_json)
+  };
+}
+
+// Record an unknown juice column. INSERT IGNORE on (plan_date, keyword) so re-running the
+// same plan returns the existing row — including one already resolved, which the caller
+// leaves alone.
+async function savePendingJuice({ date, header, keyword, englishName = null, color = null, total, context }) {
+  await categoryEnumReady;
+  const planDate = toMySQLDate(date);
+  await pool.execute(
+    `INSERT IGNORE INTO pending_juices (plan_date, header, keyword, english_name, color, total, context_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [planDate, header.slice(0, 255), keyword.slice(0, 100), englishName, color, total, JSON.stringify(context)]
+  );
+  const [rows] = await pool.execute(
+    'SELECT * FROM pending_juices WHERE plan_date = ? AND keyword = ?',
+    [planDate, keyword.slice(0, 100)]
+  );
+  return rows.length ? pendingJuiceFromRow(rows[0]) : null;
+}
+
+async function getPendingJuice(id) {
+  const [rows] = await pool.execute('SELECT * FROM pending_juices WHERE id = ?', [id]);
+  return rows.length ? pendingJuiceFromRow(rows[0]) : null;
+}
+
+// Unknown juice columns still waiting to be named, newest plan first.
+async function listPendingJuices() {
+  const [rows] = await pool.execute(
+    `SELECT * FROM pending_juices WHERE status = 'pending' ORDER BY plan_date DESC, id DESC`
+  );
+  return rows.map(pendingJuiceFromRow);
+}
+
+// Other plans still waiting on the same juice — recorded together when it is added, so a
+// juice that sat unnamed for a few days is backfilled in one go.
+async function getPendingJuicesByKeyword(keyword, excludeId) {
+  const [rows] = await pool.execute(
+    `SELECT * FROM pending_juices WHERE keyword = ? AND status = 'pending' AND id <> ? ORDER BY plan_date`,
+    [keyword, excludeId]
+  );
+  return rows.map(pendingJuiceFromRow);
+}
+
+// Atomically move a pending juice to 'added' or 'ignored'. The status = 'pending' guard makes
+// a double submit a no-op: only one caller gets true.
+async function resolvePendingJuice(id, status, category, by) {
+  const [result] = await pool.execute(
+    `UPDATE pending_juices SET status = ?, category = ?, resolved_by = ?, resolved_at = NOW()
+     WHERE id = ? AND status = 'pending'`,
+    [status, category, by, id]
+  );
+  return result.affectedRows === 1;
+}
+
+// Undo a claim whose follow-up failed, so it can be tried again instead of being stuck.
+async function reopenPendingJuice(id) {
+  await pool.execute(
+    `UPDATE pending_juices SET status = 'pending', category = NULL, resolved_by = NULL, resolved_at = NULL
+     WHERE id = ?`,
+    [id]
+  );
+}
+
+// Register a new juice. The ENUM is widened first: a category row whose value
+// daily_records refuses would make every later plan fail to save that juice.
+async function addCategory(category, { thaiName, englishName = null, color = null, icon = null, keywords }, by) {
+  await ensureCategoryEnum([...CATEGORIES, category]);
+  await pool.execute(
+    'INSERT INTO product_categories (category, thai_name, english_name, color, icon, keywords, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [category, thaiName, englishName, color, icon, JSON.stringify(keywords), by]
+  );
+  await refreshCategories();
+}
+
+async function updateCategory(category, { thaiName, englishName, color, icon, keywords }) {
+  const [result] = await pool.execute(
+    'UPDATE product_categories SET thai_name = ?, english_name = ?, color = ?, icon = ?, keywords = ? WHERE category = ?',
+    [thaiName, englishName, color, icon, JSON.stringify(keywords), category]
+  );
+  await refreshCategories();
+  return result.affectedRows === 1;
+}
+
+// Display settings for a built-in juice, set on the juice page; null fields keep the
+// look it ships with. Only names, colour and icon — its keywords stay in code.
+async function setBuiltinDisplay(category, { thaiName, englishName, color, icon }) {
+  await pool.execute(
+    'REPLACE INTO juice_display (category, thai_name, english_name, color, icon) VALUES (?, ?, ?, ?, ?)',
+    [category, thaiName, englishName, color, icon]
+  );
+  await refreshCategories();
+}
+
+async function resetBuiltinDisplay(category) {
+  await pool.execute('DELETE FROM juice_display WHERE category = ?', [category]);
+  await refreshCategories();
+}
+
+// Point another spelling at a juice (built-in or auto-added), or at null so a column with
+// that name is never auto-added again.
+async function addJuiceAlias(keyword, category) {
+  await pool.execute('REPLACE INTO juice_aliases (keyword, category) VALUES (?, ?)', [keyword, category]);
+  await refreshCategories();
+}
+
+async function listCustomCategories() {
+  const [rows] = await pool.query('SELECT * FROM product_categories ORDER BY created_at DESC, category');
+  return rows;
+}
+
+// Days recorded, bottles and last date per category, for the juice page.
+async function getCategoryStats(categories) {
+  if (!categories.length) return {};
+  const [rows] = await pool.query(
+    `SELECT category, COUNT(*) AS days, SUM(total_sum) AS bottles, MAX(date) AS last_date
+     FROM daily_records WHERE category IN (?) GROUP BY category`,
+    [categories]
+  );
+  return Object.fromEntries(rows.map(r => [r.category, {
+    days: Number(r.days),
+    bottles: Number(r.bottles) || 0,
+    lastDate: toDisplayDate(r.last_date)
+  }]));
+}
+
+// The spellings stored on a product_categories row, read inside a transaction.
+async function categoryKeywords(conn, category) {
+  const [rows] = await conn.execute('SELECT keywords FROM product_categories WHERE category = ?', [category]);
+  try {
+    return JSON.parse(rows[0]?.keywords || '[]');
+  } catch {
+    return [];
+  }
+}
+
+// Fold an auto-added juice into another one (a duplicate from an OCR misread): its records
+// move over, its spellings become aliases of the target, and it is removed. Refused when
+// both have a record on the same day — that plan carried both columns, so they really are
+// different juices, and moving the records would count that day twice.
+async function mergeCategory(from, to) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [clash] = await conn.execute(
+      `SELECT DATE_FORMAT(a.date, '%d/%m/%Y') AS d FROM daily_records a
+       JOIN daily_records b ON b.date = a.date AND b.category = ?
+       WHERE a.category = ? ORDER BY a.date`,
+      [to, from]
+    );
+    if (clash.length) {
+      await conn.rollback();
+      return { clash: clash.map(r => r.d) };
+    }
+    const [moved] = await conn.execute('UPDATE daily_records SET category = ? WHERE category = ?', [to, from]);
+    for (const keyword of await categoryKeywords(conn, from)) {
+      await conn.execute('REPLACE INTO juice_aliases (keyword, category) VALUES (?, ?)', [keyword, to]);
+    }
+    await conn.execute('UPDATE juice_aliases SET category = ? WHERE category = ?', [to, from]);
+    await conn.execute('UPDATE pending_juices SET category = ? WHERE category = ?', [to, from]);
+    await conn.execute('DELETE FROM product_categories WHERE category = ?', [from]);
+    await conn.commit();
+    return { moved: moved.affectedRows };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+    await refreshCategories();
+  }
+}
+
+// Remove an auto-added juice that isn't really one (a junk column) together with its
+// records, and remember its spellings so the same column is never auto-added again.
+async function deleteCategory(category) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [deleted] = await conn.execute('DELETE FROM daily_records WHERE category = ?', [category]);
+    for (const keyword of await categoryKeywords(conn, category)) {
+      await conn.execute('REPLACE INTO juice_aliases (keyword, category) VALUES (?, NULL)', [keyword]);
+    }
+    await conn.execute('UPDATE juice_aliases SET category = NULL WHERE category = ?', [category]);
+    await conn.execute(`UPDATE pending_juices SET status = 'ignored' WHERE category = ?`, [category]);
+    await conn.execute('DELETE FROM product_categories WHERE category = ?', [category]);
+    await conn.commit();
+    return { deleted: deleted.affectedRows };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+    await refreshCategories();
+  }
+}
 
 // Convert record from database format to application format
 function dbToAppRecord(row) {
@@ -582,5 +938,30 @@ module.exports = {
   cdcColumnMapping,
   columnToCdcMapping,
   CATEGORIES,
-  CATEGORY_NAMES
+  CATEGORY_NAMES,
+  CUSTOM_KEYWORDS,
+  CATEGORY_ENGLISH_NAMES,
+  JUICE_COLORS,
+  JUICE_ICONS,
+  JUICE_ALIASES,
+  BUILTIN_CATEGORIES,
+  BUILTIN_CATEGORY_NAMES,
+  BUILTIN_ENGLISH_NAMES,
+  DISPLAY_OVERRIDES,
+  setBuiltinDisplay,
+  resetBuiltinDisplay,
+  refreshCategories,
+  savePendingJuice,
+  getPendingJuice,
+  getPendingJuicesByKeyword,
+  resolvePendingJuice,
+  reopenPendingJuice,
+  addCategory,
+  updateCategory,
+  addJuiceAlias,
+  listCustomCategories,
+  getCategoryStats,
+  mergeCategory,
+  deleteCategory,
+  listPendingJuices
 };

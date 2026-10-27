@@ -3,10 +3,12 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 const OpenAI = require('openai');
 const { DocumentAnalysisClient, AzureKeyCredential } = require('@azure/ai-form-recognizer');
+const jpeg = require('jpeg-js');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const db = require('./db');
 
 // Debug logging to file
@@ -233,6 +235,16 @@ async function isDateRecorded(date, category) {
   }
 }
 
+// Reload auto-added juices. A failure keeps the last loaded list (built-ins at minimum):
+// a dashboard or an OCR run must not fail because this lookup did.
+async function refreshCategories() {
+  try {
+    await db.refreshCategories();
+  } catch (error) {
+    console.error('[CATEGORY] Could not refresh auto-added juices:', error.message);
+  }
+}
+
 // Product detection configuration - keywords to identify each product in column headers
 // Detection uses longest-matching-keyword scoring: when multiple products match the same cell,
 // the product with the longest matching keyword wins (e.g. "มุกป๊อป" beats "น้ำส้ม" in
@@ -267,6 +279,22 @@ const PRODUCT_DETECTION = {
     dbCategory: 'watermelon'
   }
 };
+
+// Built-in juices plus auto-added ones (db.CUSTOM_KEYWORDS, from product_categories), each
+// with any spellings merged into it on the juice page (db.JUICE_ALIASES).
+function getProductDetection() {
+  const detection = {};
+  for (const [key, config] of Object.entries(PRODUCT_DETECTION)) {
+    detection[key] = { ...config, keywords: [...config.keywords] };
+  }
+  for (const [category, keywords] of Object.entries(db.CUSTOM_KEYWORDS)) {
+    if (!detection[category]) detection[category] = { keywords: [...keywords], dbCategory: category };
+  }
+  for (const [keyword, category] of Object.entries(db.JUICE_ALIASES)) {
+    if (category && detection[category]) detection[category].keywords.push(keyword);
+  }
+  return detection;
+}
 
 // Helper function to parse numbers from OCR
 // Handles: commas, periods as thousand separators (OCR misreads), newlines/whitespace
@@ -462,7 +490,7 @@ const CDC_NAME_MAPPING = {
 // is "won" by its highest-scoring product. Each product is assigned to its best-won column.
 // This resolves substring collisions like "น้ำส้ม" ⊂ "น้ำส้มมุกป๊อป" — pop's "มุกป๊อป" (7)
 // beats orange's "น้ำส้ม" (6), so pop wins that column.
-function detectProductColumns(table) {
+function detectProductColumns(table, detection = getProductDetection()) {
   console.log('[DETECT] Scanning table for product columns (longest-match scoring)...');
 
   // Stage 1: collect best (productKey, score) per (rowIdx, colIdx) cell
@@ -477,7 +505,7 @@ function detectProductColumns(table) {
       if (!cellText) continue;
 
       let best = null;
-      for (const [productKey, productConfig] of Object.entries(PRODUCT_DETECTION)) {
+      for (const [productKey, productConfig] of Object.entries(detection)) {
         let longest = 0;
         for (const keyword of productConfig.keywords) {
           const kw = keyword.toLowerCase();
@@ -584,6 +612,179 @@ function detectOrangeByPosition(table, detectedProducts) {
     };
     console.log(`[DETECT] Fallback: assigned orange → column ${chosenCol} (OCR garbled header, position-inferred)`);
   }
+}
+
+// Find juice columns that carry bottles but matched no PRODUCT_DETECTION keyword.
+// layout.productCols spans every column between the warehouse and the crate columns, so a
+// juice the sheet adds before we add its keyword shows up here as an unclaimed column —
+// the recording loop only walks detectedProducts, so without this its bottles are dropped
+// silently (which is how น้ำแตงโม went unrecorded until it got a keyword).
+// Bottles are summed straight from the cells, without crate reconstruction: that fills a
+// blank cell from its row's crates, which here would just re-count another juice's row.
+function detectUnknownJuiceColumns(table, detectedProducts, layout, yodruamTotals = {}) {
+  const claimedCols = new Set(Object.values(detectedProducts).map(p => p.column));
+  const unknown = [];
+
+  for (const colIdx of layout.productCols) {
+    if (claimedCols.has(colIdx)) continue;
+
+    // Header text comes only from the rows above the first vendor row, so a totals row
+    // inside the table can't leak its number into the column name.
+    const headerParts = [];
+    let bottles = 0;
+    let inBody = false;
+    for (const row of table) {
+      if (!row) continue;
+      const c0 = row[0] ? row[0].toString() : '';
+      const cell = row[colIdx] ? row[colIdx].toString().trim() : '';
+      if (/FC\d+/.test(c0)) {
+        inBody = true;
+        bottles += parseOCRNumber(cell);
+      } else if (!inBody && cell && !headerParts.includes(cell)) {
+        headerParts.push(cell);
+      }
+    }
+
+    // ยอดรวม is the figure on the sheet, so prefer it over our own cell sum when OCR found it
+    const total = yodruamTotals[colIdx] || bottles;
+    if (total > 0) {
+      unknown.push({ column: colIdx, header: headerParts.join(' ') || `C${colIdx}`, total });
+      console.warn(`[DETECT] Unknown juice column ${colIdx} "${headerParts.join(' ')}" carries ${total} bottles — not recorded`);
+    }
+  }
+
+  return unknown;
+}
+
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? ((g - b) / d + (g < b ? 6 : 0)) / 6
+    : max === g ? ((b - r) / d + 2) / 6
+      : ((r - g) / d + 4) / 6;
+  return { h, s, l };
+}
+
+function hslToHex(h, s, l) {
+  const f = n => {
+    const k = (n + h * 12) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(c * 255).toString(16).padStart(2, '0');
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+// A very light version of a colour, for the section background behind a juice's table.
+function tintColor(hex, amount = 0.9) {
+  const n = parseInt(hex.slice(1), 16);
+  const mix = c => Math.round(c + (255 - c) * amount).toString(16).padStart(2, '0');
+  return `#${mix(n >> 16)}${mix((n >> 8) & 255)}${mix(n & 255)}`;
+}
+
+// Background colour of a juice column, read off the plan image, so the dashboard shows a
+// juice added automatically in the colour its column has on the sheet. Only the cells Azure
+// placed in this column are sampled, inset from their edges, and the most common saturated
+// colour wins — cell text, grid lines and JPEG noise don't decide it. Too light a colour is
+// darkened (same hue) because the dashboard puts white text on it and uses it as text on white.
+// null — the caller falls back to a default — for anything but a JPEG, or a column with no
+// real colour (white/grey/black), which is what a column OCR mis-assigned would look like.
+function sampleColumnColor(imageBuffer, rawResult, columnIndex) {
+  try {
+    if (!imageBuffer || imageBuffer[0] !== 0xFF || imageBuffer[1] !== 0xD8) return null;
+    const table = rawResult?.tables?.[0];
+    const page = rawResult?.pages?.[0];
+    if (!table || !page) return null;
+
+    const img = jpeg.decode(imageBuffer, { useTArray: true, maxMemoryUsageInMB: 256 });
+    // Polygons come in the page's unit; for an image that is pixels, but scale anyway.
+    const sx = img.width / (page.width || img.width);
+    const sy = img.height / (page.height || img.height);
+
+    const bins = new Map();   // colour quantised to 4 bits/channel → summed pixels
+    for (const cell of table.cells) {
+      if (cell.columnIndex !== columnIndex) continue;
+      const poly = cell.boundingRegions?.[0]?.polygon;
+      if (!poly || poly.length < 4) continue;
+      const xs = poly.map(p => p.x * sx);
+      const ys = poly.map(p => p.y * sy);
+      const ix = (Math.max(...xs) - Math.min(...xs)) * 0.15;
+      const iy = (Math.max(...ys) - Math.min(...ys)) * 0.15;
+      const x0 = Math.max(0, Math.round(Math.min(...xs) + ix));
+      const x1 = Math.min(img.width - 1, Math.round(Math.max(...xs) - ix));
+      const y0 = Math.max(0, Math.round(Math.min(...ys) + iy));
+      const y1 = Math.min(img.height - 1, Math.round(Math.max(...ys) - iy));
+      for (let y = y0; y <= y1; y += 2) {
+        for (let x = x0; x <= x1; x += 2) {
+          const i = (y * img.width + x) * 4;
+          const r = img.data[i], g = img.data[i + 1], b = img.data[i + 2];
+          const { s, l } = rgbToHsl(r, g, b);
+          if (s < 0.25 || l > 0.92 || l < 0.12) continue;
+          const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+          const bin = bins.get(key) || { n: 0, r: 0, g: 0, b: 0 };
+          bin.n++; bin.r += r; bin.g += g; bin.b += b;
+          bins.set(key, bin);
+        }
+      }
+    }
+
+    let best = null;
+    for (const bin of bins.values()) if (!best || bin.n > best.n) best = bin;
+    if (!best || best.n < 50) return null;
+    const { h, s, l } = rgbToHsl(best.r / best.n, best.g / best.n, best.b / best.n);
+    return hslToHex(h, s, Math.min(l, 0.55));
+  } catch (error) {
+    console.warn(`[JUICE] Could not read the colour of column ${columnIndex}:`, error.message);
+    return null;
+  }
+}
+
+// "จำนวน น้ำ มะม่วง (ขวด)" → "มะม่วง": drop the words every juice header shares, leaving the
+// part that names this juice — the keyword future plans will be matched on. Only a leading
+// "น้ำ" is stripped, so a name like "มะพร้าวน้ำหอม" keeps the น้ำ its header actually shows.
+function juiceKeywordFromHeader(header) {
+  return String(header || '')
+    .replace(/\(.*?\)/g, ' ')
+    .split(/\s+/)
+    .filter(t => t && !['จำนวน', 'น้ำ', 'ขวด'].includes(t))
+    .join(' ')
+    .replace(/^น้ำ\s*/, '')
+    .replace(/[<>&"'`]/g, '')
+    .trim();
+}
+
+// Header text of the non-juice columns. A juice keyword contained in any of these would
+// make detectProductColumns claim a crate/vendor/warehouse column as that juice.
+const NON_JUICE_HEADER_WORDS = ['vendor', 'คลังส่งสินค้า', 'ตะกร้าเต็ม', 'ตะกร้าเศษ', 'ตะกร้ารวม',
+  'จำนวนรถ', 'รายชื่อผู้ส่งสินค้า', 'เวลาโหลดสินค้า', 'เวลาจัดส่งสินค้า', 'ยอดรวม', ...CDC_NAMES];
+
+// The juice (built-in or auto-added) that already answers to this exact keyword.
+function categoryForKeyword(keyword) {
+  const kw = String(keyword || '').toLowerCase();
+  for (const [category, config] of Object.entries(getProductDetection())) {
+    if (config.keywords.some(k => k.toLowerCase() === kw)) return category;
+  }
+  return null;
+}
+
+// Why a keyword can't name a juice, or null when it can. selfCategory is the juice being
+// renamed, whose own keywords don't count as a clash.
+function juiceKeywordProblem(keyword, selfCategory = null) {
+  if (!keyword || keyword.length < 2) return 'อ่านชื่อน้ำจากหัวคอลัมน์ไม่ได้';
+  if (keyword.length > 30) return `ชื่อ "${keyword}" ยาวเกินไป`;
+  const existing = categoryForKeyword(keyword);
+  if (existing && existing !== selfCategory) {
+    return `"${keyword}" เป็นชื่อของ ${db.CATEGORY_NAMES[existing] || existing} อยู่แล้ว`;
+  }
+  const kw = keyword.toLowerCase();
+  if (NON_JUICE_HEADER_WORDS.some(w => w.toLowerCase().includes(kw))) {
+    return `"${keyword}" ซ้ำกับหัวคอลัมน์อื่นในตาราง`;
+  }
+  return null;
 }
 
 // Validate table has data (check FC33 หาดใหญ่ or FC07 ภูเก็ต in any detected product column)
@@ -1016,13 +1217,16 @@ function extractYodruamTotals(rawResult) {
 }
 
 // Record daily data - dynamically detects products from column headers
-async function recordDailyData(tableData, extractedText = '', rawResult = null) {
+async function recordDailyData(tableData, extractedText = '', rawResult = null, imageBuffer = null) {
   if (!tableData || tableData.length === 0) {
     console.log('No table data to record');
     return { success: false, reason: 'No table data found' };
   }
 
   const table = tableData[0];
+
+  // Auto-added juices live in the DB; another process may have added or changed one since boot.
+  await refreshCategories();
 
   // Step 1: Detect product columns from headers
   const detectedProducts = detectProductColumns(table);
@@ -1135,13 +1339,75 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
     results.push({ category, record: dailyRecord });
   }
 
+  // Only checked on a run that recorded something — once per plan per day. A re-send of an
+  // already-recorded plan records nothing, so it does not repeat the alert.
+  const unknownJuices = results.length > 0
+    ? detectUnknownJuiceColumns(table, detectedProducts, layout, yodruamTotals)
+    : [];
+
+  // A juice column whose name reads cleanly is added and recorded right away — translated,
+  // coloured from the image — and the dev is only told, with the juice page link to fix
+  // anything. One whose name can't be used is kept unrecorded for the dev to name there:
+  // auto-adding it would leave nothing to match tomorrow's plan, so every day would add
+  // another juice. A name deleted on the juice page (alias → null) is skipped silently.
+  const juiceLines = [];
+  let juicesWaiting = 0;
+  for (const j of unknownJuices) {
+    const keyword = juiceKeywordFromHeader(j.header);
+    if (keyword && db.JUICE_ALIASES[keyword] === null) {
+      console.log(`[JUICE] Skipping column ${j.column} "${keyword}" — deleted on the juice page`);
+      continue;
+    }
+    const problem = juiceKeywordProblem(keyword);
+    try {
+      const englishName = problem ? null : await translateJuiceName(`น้ำ${keyword}`);
+      const color = sampleColumnColor(imageBuffer, rawResult, j.column);
+      const pending = await db.savePendingJuice({
+        date: dateStr,
+        header: j.header,
+        keyword,
+        englishName,
+        color,
+        total: j.total,
+        context: { table, layout, column: j.column, yodruamTotal: yodruamTotals[j.column] || 0, hadyaiSum: validation.hadyaiSum }
+      });
+      if (!pending || pending.status !== 'pending') continue;   // this plan was handled before
+
+      if (problem) {
+        juicesWaiting++;
+        juiceLines.push(`  ⚠️ "${j.header}" ${j.total.toLocaleString()} ขวด — ${problem} ยังไม่ถูกบันทึก`);
+        continue;
+      }
+      const added = await addJuiceFromPending(pending, {}, 'auto');
+      if (added.error) {
+        juicesWaiting++;
+        juiceLines.push(`  ⚠️ "${j.header}" ${j.total.toLocaleString()} ขวด — ${added.error} ยังไม่ถูกบันทึก`);
+      } else {
+        juiceLines.push(`  🆕 เพิ่ม "${added.thaiName}"${added.englishName ? ` (${added.englishName})` : ''} อัตโนมัติ\n`
+          + added.lines.map(l => `     ${l}`).join('\n'));
+      }
+    } catch (error) {
+      console.error('[JUICE] Could not add unknown juice:', error);
+      juicesWaiting++;
+      juiceLines.push(`  ⚠️ "${j.header}" ${j.total.toLocaleString()} ขวด — เพิ่มอัตโนมัติไม่สำเร็จ (${error.message})`);
+    }
+  }
+
   // Raised after saving, and deliberately not awaited into the success/failure result:
   // the day is recorded either way, this only tells a human to go look at the image.
   // An unplaceable branch is worth its own alert even when the totals happen to add up,
   // because the fix is a code change (add it to CDC_NAMES and daily_records), not a
   // re-scan of the image.
-  if (reconcileIssues.length > 0 || unknownBranches.size > 0) {
+  if (reconcileIssues.length > 0 || unknownBranches.size > 0 || juiceLines.length > 0) {
     const sections = [];
+
+    if (juiceLines.length > 0) {
+      sections.push(
+        `[น้ำชนิดใหม่]\n`
+        + juiceLines.join('\n')
+        + `\n  ตรวจหรือแก้ชื่อ สี${juicesWaiting ? ' และตั้งชื่อน้ำที่ยังไม่ถูกบันทึก' : ''}:\n  ${juicePageUrl()}`
+      );
+    }
 
     if (unknownBranches.size > 0) {
       sections.push(
@@ -1167,11 +1433,21 @@ async function recordDailyData(tableData, extractedText = '', rawResult = null) 
 
     const headline = reconcileIssues.length > 0
       ? '⚠️ OCR ไม่ตรงยอดรวม'
-      : '⚠️ OCR เจอสาขาที่ไม่รู้จัก';
+      : unknownBranches.size > 0
+        ? '⚠️ OCR เจอสาขาที่ไม่รู้จัก'
+        : juicesWaiting > 0
+          ? '⚠️ พบน้ำชนิดใหม่ที่อ่านชื่อไม่ได้'
+          : '🆕 พบน้ำชนิดใหม่';
+
+    const note = (reconcileIssues.length > 0 || unknownBranches.size > 0)
+      ? 'บันทึกลงฐานข้อมูลแล้ว แต่ตัวเลขอาจผิด กรุณาเทียบกับภาพต้นฉบับ'
+      : juicesWaiting > 0
+        ? 'น้ำที่อ่านชื่อได้บันทึกแล้ว แต่ยังมีน้ำที่ต้องตั้งชื่อก่อนจึงจะบันทึก'
+        : 'เพิ่มและบันทึกให้อัตโนมัติแล้ว ถ้าชื่อหรือสีผิด แก้ได้ที่ลิงก์ด้านล่าง';
 
     await sendDevAlert(
       `${headline} — ${dateStr}\n\n`
-      + `บันทึกลงฐานข้อมูลแล้ว แต่ตัวเลขอาจผิด กรุณาเทียบกับภาพต้นฉบับ\n\n`
+      + `${note}\n\n`
       + sections.join('\n\n')
       + `\n\nhttps://shinsen.yushi-marketing.com/daily-report`
     );
@@ -1339,7 +1615,8 @@ const app = express();
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  // The juice page's token is its only protection — keep it out of the logs.
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path.replace(/^\/juices\/[^/]+/, '/juices/***')}`);
   next();
 });
 
@@ -1539,6 +1816,140 @@ async function handleEvent(event) {
   return null;
 }
 
+// ---------- New juices (auto-added from plans) ----------
+
+// English label for a new juice, shown where the daily report uses English names for
+// built-in juices (summary cards, chart legend, table title). A slow or failed call only
+// costs the label: it gives up after 5s without retrying and returns null, and the report
+// falls back to the Thai name.
+async function translateJuiceName(thaiName) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 20,
+      temperature: 0,
+      messages: [{
+        role: 'user',
+        content: 'Translate this Thai juice product name into a short English product name: '
+          + 'the fruit or flavour only, Title Case, at most 3 words, without the word "Juice", '
+          + 'no quotes or punctuation. Examples: น้ำส้ม → Orange, น้ำผลไม้รวม → Mixed Fruit.\n'
+          + `Thai: ${thaiName}`
+      }]
+    }, { timeout: 5000, maxRetries: 0 });   // measured 1.5–2.5s; 3s cut too many off
+    return cleanEnglishName(response.choices?.[0]?.message?.content);
+  } catch (error) {
+    console.warn(`[JUICE] Could not translate "${thaiName}":`, error.message);
+    return null;
+  }
+}
+
+// Letters, digits and simple joiners only — the label goes into report HTML and chart JS.
+// Thai text is refused rather than stripped, so a name typed in Thai is reported, not mangled.
+function cleanEnglishName(text) {
+  const raw = String(text || '');
+  if (/[฀-๿]/.test(raw)) return null;
+  const english = raw.replace(/[^A-Za-z0-9 &'-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return english || null;
+}
+
+// Add a waiting juice column as a new juice and record it — plus any other plan still
+// waiting on the same name — from the OCR table kept with it. Used for the automatic add
+// (by 'auto') and for a name given on the juice page (by 'web'); thaiName / englishName
+// override what was read off the header and the translation made from it.
+// Returns { thaiName, englishName, lines } or { error }.
+async function addJuiceFromPending(pending, { thaiName: givenName = null, englishName: givenEnglish = null, icon = null } = {}, by = 'auto') {
+  await refreshCategories();
+  const keyword = givenName != null ? juiceKeywordFromHeader(givenName) : pending.keyword;
+
+  // A given name that is already a juice means "OCR misread this header — it's that one".
+  const existing = givenName != null ? categoryForKeyword(keyword) : null;
+  if (existing) return recordPendingAsExisting(pending, existing, by);
+
+  const problem = juiceKeywordProblem(keyword);
+  if (problem) return { error: problem };
+
+  const category = `juice_${pending.id}`;
+  const thaiName = `น้ำ${keyword}`;
+  // When the name was corrected, keep matching on what OCR read too — the next plan will
+  // most likely be read the same way.
+  const keywords = [keyword];
+  if (pending.keyword !== keyword && !juiceKeywordProblem(pending.keyword)) keywords.push(pending.keyword);
+
+  if (!(await db.resolvePendingJuice(pending.id, 'added', category, by))) {
+    return { error: 'รายการนี้ถูกจัดการไปแล้ว' };
+  }
+  const englishName = givenEnglish
+    || (keyword === pending.keyword && pending.englishName)
+    || await translateJuiceName(thaiName);
+  try {
+    await db.addCategory(category, { thaiName, englishName, color: pending.color, icon, keywords }, by);
+  } catch (error) {
+    await db.reopenPendingJuice(pending.id);
+    throw error;
+  }
+  console.log(`[JUICE] Added ${category} "${thaiName}" / ${englishName || '(no English name)'} / ${pending.color || 'default colour'} (keywords: ${keywords.join(', ')}) by ${by}`);
+
+  return { thaiName, englishName, lines: await recordPendingFamily(pending, category, by) };
+}
+
+// Record a waiting column under a juice that already exists, and teach that juice the
+// spelling OCR read, so the next plan read the same way matches on its own.
+async function recordPendingAsExisting(pending, category, by) {
+  if (!(await db.resolvePendingJuice(pending.id, 'added', category, by))) {
+    return { error: 'รายการนี้ถูกจัดการไปแล้ว' };
+  }
+  if (!juiceKeywordProblem(pending.keyword)) await db.addJuiceAlias(pending.keyword, category);
+  console.log(`[JUICE] Pending #${pending.id} "${pending.keyword}" recorded as existing ${category} by ${by}`);
+  return {
+    thaiName: db.CATEGORY_NAMES[category] || category,
+    englishName: db.CATEGORY_ENGLISH_NAMES[category] || null,
+    existing: true,
+    lines: await recordPendingFamily(pending, category, by)
+  };
+}
+
+// This plan's column, plus other plans still waiting on the same name. Columns whose name
+// couldn't be read share an empty keyword without being the same juice, so those are
+// only ever recorded one at a time.
+async function recordPendingFamily(pending, category, by) {
+  const lines = [await recordPendingJuice(pending, category)];
+  if (!pending.keyword) return lines;
+  for (const other of await db.getPendingJuicesByKeyword(pending.keyword, pending.id)) {
+    if (await db.resolvePendingJuice(other.id, 'added', category, by)) {
+      lines.push(await recordPendingJuice(other, category));
+    }
+  }
+  return lines;
+}
+
+// Record a waiting column the way recordDailyData records a known juice: per-CDC from the
+// table, with the ยอดรวม printed on the plan as the authoritative total.
+// Never throws — the juice is already added, so one bad day must not hide the others.
+async function recordPendingJuice(pending, category) {
+  const { table, layout, column, yodruamTotal, hadyaiSum } = pending.context;
+  try {
+    if (await isDateRecorded(pending.date, category)) return `${pending.date}: มีข้อมูลอยู่แล้ว`;
+    const { cdcTotals, totalSum } = extractCDCTotals(table, column, yodruamTotal, layout);
+    const finalTotalSum = yodruamTotal > 0 ? yodruamTotal : totalSum;
+    await saveDailyRecord({
+      date: pending.date,
+      timestamp: new Date().toISOString(),
+      fc33HadyaiSum: hadyaiSum,
+      totalSum: finalTotalSum,
+      cdcTotals
+    }, category);
+    const cdcSum = Object.values(cdcTotals).reduce((a, b) => a + b, 0);
+    const check = cdcSum === finalTotalSum
+      ? '✓ รายสาขาตรงยอดรวม'
+      : `⚠️ รายสาขารวม ${cdcSum.toLocaleString()} ไม่ตรงยอดรวม กรุณาเทียบกับภาพ`;
+    console.log(`[JUICE] Recorded ${category} for ${pending.date}: ${finalTotalSum}`);
+    return `${pending.date}: บันทึก ${finalTotalSum.toLocaleString()} ขวด ${check}`;
+  } catch (error) {
+    console.error(`[JUICE] Could not record ${category} for ${pending.date}:`, error);
+    return `${pending.date}: ❌ บันทึกไม่สำเร็จ (${error.message})`;
+  }
+}
+
 // An image event gets this many tries before it is buried as 'failed'. Generous
 // because most retries exist to recover from the process being reaped, not from
 // anything wrong with the image itself.
@@ -1697,7 +2108,7 @@ async function performOCR(imageBuffer, messageId = 'unknown', sourceInfo = null)
     // Record daily data if conditions are met
     let recordResult = null;
     try {
-      recordResult = await recordDailyData(tableData, extractedText, result);
+      recordResult = await recordDailyData(tableData, extractedText, result, imageBuffer);
       if (recordResult && recordResult.success) {
         console.log('Daily data recorded successfully');
 
@@ -2079,6 +2490,11 @@ app.get('/transformed-data', (req, res) => {
 // Passenger, so that file wins over this route while it exists.
 app.get('/', (req, res) => res.redirect('/daily-report'));
 
+// Pages that list juices pick up ones added or changed by another process.
+app.use(['/daily-report', '/mtd-report', '/targets'], (req, res, next) => {
+  refreshCategories().then(() => next());
+});
+
 app.get('/daily-report', async (req, res) => {
   try {
     // Get current date for default filter
@@ -2094,15 +2510,21 @@ app.get('/daily-report', async (req, res) => {
     const records = await db.getDailyRecordsByMonth(selectedMonth, selectedYear);
 
     // Generate table HTML for each category
-    const categoryData = {
-      orange: { records: records.orange || [], name: 'Orange', thaiName: 'น้ำส้ม', icon: '🍊', bgColor: '#fff3e0', borderColor: '#ff9800' },
-      yuzu: { records: records.yuzu || [], name: 'Yuzu', thaiName: 'ยูซุ', icon: '🍋', bgColor: '#fffde7', borderColor: '#fdd835' },
-      pop: { records: records.pop || [], name: 'Shinsen Pop', thaiName: 'Shinsen Pop', icon: '🍹', bgColor: '#e1f5fe', borderColor: '#03a9f4' },
-      mixed: { records: records.mixed || [], name: 'Mixed Fruit', thaiName: 'น้ำผลไม้รวม', icon: '🍇', bgColor: '#f3e5f5', borderColor: '#9c27b0' },
-      tomato: { records: records.tomato || [], name: 'Tomato Yuzu', thaiName: 'Tomato Yuzu', icon: '🍅', bgColor: '#ffebee', borderColor: '#f44336' },
-      pineapple: { records: records.pineapple || [], name: 'Pineapple', thaiName: 'น้ำสับปะรด', icon: '🍍', bgColor: '#f9fbe7', borderColor: '#cddc39' },
-      watermelon: { records: records.watermelon || [], name: 'Watermelon', thaiName: 'น้ำแตงโม', icon: '🍉', bgColor: '#fce4ec', borderColor: '#e57373' }
-    };
+    // Names, icon and colour come from the same place as every other page, so what is set
+    // on the juice page shows here too.
+    const categoryData = {};
+    for (const cat of db.CATEGORIES) {
+      const thaiName = db.CATEGORY_NAMES[cat] || cat;
+      const color = juiceColor(cat);
+      categoryData[cat] = {
+        records: records[cat] || [],
+        name: db.CATEGORY_ENGLISH_NAMES[cat] || thaiName,
+        thaiName,
+        icon: juiceIcon(cat),
+        bgColor: (!db.JUICE_COLORS[cat] && CATEGORY_TINTS[cat]) || tintColor(color),
+        borderColor: color
+      };
+    }
 
     // Generate tables for each category
     const categoryTables = {};
@@ -2660,6 +3082,343 @@ app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (re
   }
 });
 
+// ---------- Juice page (linked only from dev alerts) ----------
+
+// No login: the page is reached only through the link in dev alerts. Its token is derived
+// from the LINE channel secret — stable across restarts, nothing to configure on Plesk —
+// and a wrong token gets a plain 404, as if the page didn't exist.
+const JUICE_PAGE_TOKEN = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET || '')
+  .update('juice-page').digest('hex').slice(0, 24);
+
+function juicePageUrl() {
+  return `https://shinsen.yushi-marketing.com/juices/${JUICE_PAGE_TOKEN}`;
+}
+
+function requireJuiceToken(req, res, next) {
+  const given = Buffer.from(String(req.params.token || ''));
+  const expected = Buffer.from(JUICE_PAGE_TOKEN);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+    return res.sendStatus(404);
+  }
+  // The token is in the URL; don't hand it to anything the page links to.
+  res.set('Referrer-Policy', 'no-referrer');
+  next();
+}
+
+function backToJuicePage(res, msg) {
+  res.redirect(303, `/juices/${JUICE_PAGE_TOKEN}?msg=${encodeURIComponent(msg)}`);
+}
+
+// Icons a juice can be given on the juice page. A fixed list rather than free text: the value
+// lands in report HTML, and picking from a list beats hunting for an emoji anyway.
+const JUICE_ICON_CHOICES = [
+  ['🧃', 'กล่องน้ำผลไม้'], ['🍊', 'ส้ม'], ['🍋', 'มะนาว / ยูซุ'], ['🍎', 'แอปเปิ้ลแดง'],
+  ['🍏', 'แอปเปิ้ลเขียว'], ['🍐', 'ลูกแพร์'], ['🍑', 'พีช'], ['🍒', 'เชอร์รี่'],
+  ['🍓', 'สตรอเบอร์รี่'], ['🫐', 'บลูเบอร์รี่'], ['🍇', 'องุ่น'], ['🍉', 'แตงโม'],
+  ['🍈', 'เมลอน'], ['🍌', 'กล้วย'], ['🍍', 'สับปะรด'], ['🥭', 'มะม่วง'],
+  ['🥥', 'มะพร้าว'], ['🥝', 'กีวี่'], ['🍅', 'มะเขือเทศ'], ['🥕', 'แครอท'],
+  ['🍵', 'ชา'], ['🍹', 'น้ำผลไม้ปั่น'], ['🥤', 'แก้วน้ำ']
+];
+
+// A submitted icon if it is one of the choices, otherwise `fallback`.
+function iconFromForm(value, fallback = null) {
+  return JUICE_ICON_CHOICES.some(([emoji]) => emoji === value) ? value : fallback;
+}
+
+function iconOptions(selected) {
+  return JUICE_ICON_CHOICES
+    .map(([emoji, label]) => `<option value="${emoji}"${emoji === selected ? ' selected' : ''}>${emoji} ${label}</option>`)
+    .join('');
+}
+
+// English name from a form field: blank means "none", anything else must clean up.
+function englishFromForm(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { englishName: null };
+  const englishName = cleanEnglishName(raw);
+  return englishName ? { englishName } : { error: 'ชื่ออังกฤษต้องเป็นตัวอักษรภาษาอังกฤษ เช่น Lychee' };
+}
+
+// A built-in juice's display name is free text (they aren't all "น้ำ…": ยูซุ, Shinsen Pop);
+// it only has to be safe to put in report HTML.
+function displayNameFromForm(value) {
+  return String(value || '').replace(/[<>&"'`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 50);
+}
+
+function colorFromForm(value, fallback = null) {
+  return /^#[0-9a-f]{6}$/i.test(value || '') ? value.toLowerCase() : fallback;
+}
+
+function renderJuicePage({ pendings, customs, stats, msg }) {
+  const base = `/juices/${JUICE_PAGE_TOKEN}`;
+  const detection = getProductDetection();
+  const mergeTargets = Object.values(detection).map(d => d.dbCategory);
+  const customByCategory = Object.fromEntries(customs.map(c => [c.category, c]));
+
+  const pendingHtml = pendings.length ? pendings.map(p => `
+    <div class="card" style="border-left-color:${p.color || '#bbb'}">
+      <div class="title">${escapeHtml(p.header)}</div>
+      <div class="meta">${escapeHtml(p.date)} · ${p.total.toLocaleString()} ขวด · ยังไม่ถูกบันทึก</div>
+      <form method="post" action="${base}/pending/${p.id}/add" class="fields">
+        <label>ชื่อไทย<input name="thai_name" required placeholder="เช่น ลิ้นจี่" value="${escapeHtml(p.keyword)}"></label>
+        <label>ชื่ออังกฤษ<input name="english_name" placeholder="เว้นว่างให้แปลเอง" value="${escapeHtml(p.englishName || '')}"></label>
+        <label class="icon">รูป<select name="icon">${iconOptions(NEW_JUICE_ICON)}</select></label>
+        <button>เพิ่มและบันทึกยอด</button>
+      </form>
+      <div class="hint">ถ้าเป็นน้ำที่มีอยู่แล้ว ใส่ชื่อน้ำนั้น (เช่น แตงโม) ระบบจะบันทึกยอดเข้าน้ำนั้น</div>
+      <form method="post" action="${base}/pending/${p.id}/ignore" onsubmit="return confirm('ทิ้งรายการนี้? ยอดจะไม่ถูกบันทึก')">
+        <button class="secondary">ทิ้ง</button>
+      </form>
+    </div>`).join('') : '<p class="empty">ไม่มีรายการที่รอตั้งชื่อ</p>';
+
+  // Every juice, built-in first, in dashboard order. Built-in ones only take display settings
+  // (their keywords are in code, and the plan always carries them); auto-added ones can also
+  // be merged into another juice or deleted.
+  const juiceHtml = db.CATEGORIES.map(category => {
+    const builtin = db.BUILTIN_CATEGORIES.includes(category);
+    const row = customByCategory[category];
+    const s = stats[category] || { days: 0, bottles: 0, lastDate: null };
+    const color = juiceColor(category);
+    const icon = juiceIcon(category);
+    const thaiName = db.CATEGORY_NAMES[category] || category;
+    const englishName = builtin ? db.CATEGORY_ENGLISH_NAMES[category] : (row?.english_name || '');
+    const keywords = detection[category]?.keywords || [];
+    const action = `${base}/category/${encodeURIComponent(category)}`;
+    const origin = builtin
+      ? `น้ำหลักในระบบ${db.DISPLAY_OVERRIDES[category] ? ' · แก้การแสดงผลแล้ว' : ''}`
+      : `เพิ่มเมื่อ ${escapeHtml(db.toDisplayDate(row?.created_at) || '-')} (${row?.created_by === 'web' ? 'ตั้งชื่อจากหน้านี้' : 'อัตโนมัติ'})`;
+
+    const actions = builtin
+      ? (db.DISPLAY_OVERRIDES[category] ? `
+        <form method="post" action="${action}/reset" onsubmit="return confirm('คืนชื่อ สี และรูปของน้ำนี้เป็นค่าเดิม?')">
+          <button class="secondary">คืนค่าเดิม</button>
+        </form>` : '')
+      : `
+        <form method="post" action="${action}/merge" onsubmit="return confirm('รวมเข้ากับน้ำที่เลือก? ข้อมูลทั้งหมดจะย้ายไป และน้ำนี้จะหายไป')">
+          <select name="target" required>
+            <option value="">รวมเข้ากับน้ำ…</option>
+            ${mergeTargets.filter(t => t !== category).map(t => `<option value="${escapeHtml(t)}">${escapeHtml(db.CATEGORY_NAMES[t] || t)}</option>`).join('')}
+          </select>
+          <button class="secondary">รวม</button>
+        </form>
+        <form method="post" action="${action}/delete" onsubmit="return confirm('ลบน้ำนี้พร้อมข้อมูล ${s.days} วัน? คอลัมน์ชื่อนี้จะไม่ถูกเพิ่มอีก')">
+          <button class="danger">ลบ</button>
+        </form>`;
+
+    return `
+    <div class="card" style="border-left-color:${escapeHtml(color)}">
+      <div class="title">${escapeHtml(icon)} ${escapeHtml(thaiName)}${englishName ? ` <span class="en">${escapeHtml(englishName)}</span>` : ''}</div>
+      <div class="meta">${origin} · มีข้อมูล ${s.days} วัน · รวม ${s.bottles.toLocaleString()} ขวด · ล่าสุด ${escapeHtml(s.lastDate || '-')}</div>
+      <div class="meta">คำที่ใช้จับคอลัมน์: ${keywords.map(k => escapeHtml(k)).join(', ')}</div>
+      <form method="post" action="${action}/update" class="fields">
+        <label>ชื่อไทย<input name="thai_name" required value="${escapeHtml(builtin ? thaiName : thaiName.replace(/^น้ำ/, ''))}"></label>
+        <label>ชื่ออังกฤษ<input name="english_name" placeholder="${escapeHtml(builtin ? db.BUILTIN_ENGLISH_NAMES[category] : 'เว้นว่าง = ใช้ชื่อไทย')}" value="${escapeHtml(englishName)}"></label>
+        <label class="icon">รูป<select name="icon">${iconOptions(icon)}</select></label>
+        <label class="color">สี<input type="color" name="color" value="${escapeHtml(color)}"></label>
+        <button>บันทึก</button>
+      </form>
+      ${builtin ? '<div class="hint">แก้แค่ชื่อและสีที่แสดงบน dashboard ไม่กระทบการอ่านหัวคอลัมน์</div>' : ''}
+      ${actions ? `<div class="row">${actions}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>จัดการน้ำ</title>
+  <style>
+    body { font-family: -apple-system, 'Segoe UI', Tahoma, sans-serif; background: #f5f5f5; color: #222; margin: 0; padding: 16px; }
+    main { max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 22px; margin: 4px 0 16px; }
+    h2 { font-size: 17px; margin: 28px 0 10px; color: #444; }
+    .msg { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+    .card { background: #fff; border-radius: 8px; border-left: 6px solid #bbb; padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .title { font-weight: 600; font-size: 16px; }
+    .en { color: #777; font-weight: 400; }
+    .meta, .hint { color: #666; font-size: 13px; margin-top: 4px; }
+    .fields { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-top: 10px; }
+    .fields label { display: flex; flex-direction: column; font-size: 13px; color: #555; gap: 3px; flex: 1 1 160px; }
+    .fields label.color, .fields label.icon { flex: 0 0 auto; }
+    input, select { font: inherit; padding: 7px 9px; border: 1px solid #ccc; border-radius: 6px; }
+    input[type=color] { padding: 2px; width: 52px; height: 36px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .row form { display: flex; gap: 6px; }
+    form { margin: 0; }
+    button { font: inherit; padding: 7px 14px; border: 0; border-radius: 6px; background: #2e7d32; color: #fff; cursor: pointer; }
+    button.secondary { background: #e0e0e0; color: #222; }
+    button.danger { background: #c62828; }
+    .card > form:last-child { margin-top: 8px; }
+    .empty { color: #777; }
+    .foot { margin-top: 28px; font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>จัดการน้ำ</h1>
+  ${msg ? `<div class="msg">${escapeHtml(msg)}</div>` : ''}
+  <h2>รอตั้งชื่อ (${pendings.length})</h2>
+  ${pendingHtml}
+  <h2>น้ำทั้งหมด (${db.CATEGORIES.length})</h2>
+  ${juiceHtml}
+  <p class="foot"><a href="/daily-report">Daily report</a></p>
+</main>
+</body>
+</html>`;
+}
+
+app.get('/juices/:token', requireJuiceToken, async (req, res) => {
+  try {
+    await refreshCategories();
+    const [pendings, customs, stats] = await Promise.all([
+      db.listPendingJuices(),
+      db.listCustomCategories(),
+      db.getCategoryStats(db.CATEGORIES)
+    ]);
+    res.send(renderJuicePage({ pendings, customs, stats, msg: req.query.msg }));
+  } catch (error) {
+    console.error('[JUICE-PAGE] Error rendering:', error);
+    res.status(500).send(`เกิดข้อผิดพลาด: ${escapeHtml(error.message)}`);
+  }
+});
+
+// Name a column that couldn't be added on its own, and record it.
+app.post('/juices/:token/pending/:id/add', requireJuiceToken, async (req, res) => {
+  try {
+    const pending = await db.getPendingJuice(parseInt(req.params.id, 10));
+    if (!pending || pending.status !== 'pending') return backToJuicePage(res, 'รายการนี้ถูกจัดการไปแล้ว');
+    const thaiName = String(req.body.thai_name || '').trim();
+    if (!thaiName) return backToJuicePage(res, '❌ กรุณาใส่ชื่อไทย');
+    const english = englishFromForm(req.body.english_name);
+    if (english.error) return backToJuicePage(res, `❌ ${english.error}`);
+
+    const icon = iconFromForm(req.body.icon);
+    const added = await addJuiceFromPending(pending, { thaiName, englishName: english.englishName, icon }, 'web');
+    if (added.error) return backToJuicePage(res, `❌ ${added.error}`);
+    backToJuicePage(res, `✅ ${added.existing ? 'บันทึกเข้า' : 'เพิ่ม'} "${added.thaiName}" แล้ว — ${added.lines.join(' / ')}`);
+  } catch (error) {
+    console.error('[JUICE-PAGE] Add failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
+app.post('/juices/:token/pending/:id/ignore', requireJuiceToken, async (req, res) => {
+  try {
+    const ok = await db.resolvePendingJuice(parseInt(req.params.id, 10), 'ignored', null, 'web');
+    backToJuicePage(res, ok ? 'ทิ้งรายการแล้ว ยอดนี้จะไม่ถูกบันทึก' : 'รายการนี้ถูกจัดการไปแล้ว');
+  } catch (error) {
+    console.error('[JUICE-PAGE] Ignore failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
+// Change how a built-in juice looks on the dashboards. Only what differs from the look in
+// code is stored, so a later change to that default still shows where nothing was set.
+async function updateBuiltinJuice(category, body) {
+  const thaiName = displayNameFromForm(body.thai_name);
+  if (!thaiName) return '❌ กรุณาใส่ชื่อไทย';
+  const english = englishFromForm(body.english_name);
+  if (english.error) return `❌ ${english.error}`;
+  const color = colorFromForm(body.color, juiceColor(category));
+  const icon = iconFromForm(body.icon, juiceIcon(category));
+
+  const settings = {
+    thaiName: thaiName !== db.BUILTIN_CATEGORY_NAMES[category] ? thaiName : null,
+    englishName: english.englishName && english.englishName !== db.BUILTIN_ENGLISH_NAMES[category] ? english.englishName : null,
+    color: color !== CATEGORY_COLORS[category] ? color : null,
+    icon: icon !== CATEGORY_ICONS[category] ? icon : null
+  };
+  if (Object.values(settings).every(v => v === null)) await db.resetBuiltinDisplay(category);
+  else await db.setBuiltinDisplay(category, settings);
+  console.log(`[JUICE-PAGE] Display of built-in ${category}:`, settings);
+  return `✅ บันทึก "${db.CATEGORY_NAMES[category]}" แล้ว`;
+}
+
+// Fix the names, colour or icon of a juice. For an auto-added one a corrected Thai name joins
+// its keywords rather than replacing them: tomorrow's plan may still be read the old way.
+app.post('/juices/:token/category/:category/update', requireJuiceToken, async (req, res) => {
+  try {
+    await refreshCategories();
+    const category = req.params.category;
+    if (db.BUILTIN_CATEGORIES.includes(category)) return backToJuicePage(res, await updateBuiltinJuice(category, req.body));
+    if (!db.CUSTOM_KEYWORDS[category]) return backToJuicePage(res, '❌ ไม่พบน้ำนี้');
+    const keyword = juiceKeywordFromHeader(req.body.thai_name);
+    const problem = juiceKeywordProblem(keyword, category);
+    if (problem) return backToJuicePage(res, `❌ ${problem}`);
+    const english = englishFromForm(req.body.english_name);
+    if (english.error) return backToJuicePage(res, `❌ ${english.error}`);
+    const color = colorFromForm(req.body.color, db.JUICE_COLORS[category] || null);
+    const icon = iconFromForm(req.body.icon, db.JUICE_ICONS[category] || null);
+
+    const thaiName = `น้ำ${keyword}`;
+    await db.updateCategory(category, {
+      thaiName,
+      englishName: english.englishName,
+      color,
+      icon,
+      keywords: [...new Set([...db.CUSTOM_KEYWORDS[category], keyword])]
+    });
+    console.log(`[JUICE-PAGE] Updated ${category}: "${thaiName}" / ${english.englishName || '-'} / ${color || '-'} / ${icon || '-'}`);
+    backToJuicePage(res, `✅ บันทึก "${thaiName}" แล้ว`);
+  } catch (error) {
+    console.error('[JUICE-PAGE] Update failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
+app.post('/juices/:token/category/:category/reset', requireJuiceToken, async (req, res) => {
+  try {
+    const category = req.params.category;
+    if (!db.BUILTIN_CATEGORIES.includes(category)) return backToJuicePage(res, '❌ คืนค่าเดิมได้เฉพาะน้ำหลักในระบบ');
+    await db.resetBuiltinDisplay(category);
+    console.log(`[JUICE-PAGE] Display of built-in ${category} reset`);
+    backToJuicePage(res, `✅ คืนค่าเดิมของ "${db.CATEGORY_NAMES[category]}" แล้ว`);
+  } catch (error) {
+    console.error('[JUICE-PAGE] Reset failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
+app.post('/juices/:token/category/:category/merge', requireJuiceToken, async (req, res) => {
+  try {
+    await refreshCategories();
+    const from = req.params.category;
+    const to = String(req.body.target || '');
+    const targets = Object.values(getProductDetection()).map(d => d.dbCategory);
+    if (!db.CUSTOM_KEYWORDS[from]) return backToJuicePage(res, '❌ ไม่พบน้ำนี้');
+    if (!targets.includes(to) || to === from) return backToJuicePage(res, '❌ กรุณาเลือกน้ำที่จะรวมเข้า');
+
+    const fromName = db.CATEGORY_NAMES[from] || from;
+    const toName = db.CATEGORY_NAMES[to] || to;
+    const result = await db.mergeCategory(from, to);
+    if (result.clash) {
+      return backToJuicePage(res, `❌ รวมไม่ได้: ${fromName} กับ ${toName} มีข้อมูลวันเดียวกัน (${result.clash.join(', ')}) แปลว่าเป็นน้ำคนละชนิดในภาพเดียวกัน`);
+    }
+    console.log(`[JUICE-PAGE] Merged ${from} into ${to} (${result.moved} records)`);
+    backToJuicePage(res, `✅ รวม ${fromName} เข้ากับ ${toName} แล้ว — ย้ายข้อมูล ${result.moved} วัน`);
+  } catch (error) {
+    console.error('[JUICE-PAGE] Merge failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
+app.post('/juices/:token/category/:category/delete', requireJuiceToken, async (req, res) => {
+  try {
+    await refreshCategories();
+    const category = req.params.category;
+    if (!db.CUSTOM_KEYWORDS[category]) return backToJuicePage(res, '❌ ไม่พบน้ำนี้');
+    const name = db.CATEGORY_NAMES[category] || category;
+    const result = await db.deleteCategory(category);
+    console.log(`[JUICE-PAGE] Deleted ${category} (${result.deleted} records)`);
+    backToJuicePage(res, `🗑️ ลบ ${name} แล้ว (ลบข้อมูล ${result.deleted} วัน) — คอลัมน์ชื่อนี้จะไม่ถูกเพิ่มอีก`);
+  } catch (error) {
+    console.error('[JUICE-PAGE] Delete failed:', error);
+    backToJuicePage(res, `❌ ทำรายการไม่สำเร็จ: ${error.message}`);
+  }
+});
+
 // ---------- MTD / YTD Report ----------
 
 const THAI_MONTHS = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
@@ -2673,6 +3432,18 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// The look the built-in juices ship with. What the DB holds wins (db.JUICE_ICONS /
+// db.JUICE_COLORS): set on the juice page for any juice, and for an auto-added one also
+// the colour read off its plan column. An auto-added juice with neither gets 🧃 and green.
+const NEW_JUICE_ICON = '🧃';
+function juiceIcon(category) {
+  return db.JUICE_ICONS[category] || CATEGORY_ICONS[category] || NEW_JUICE_ICON;
+}
+function juiceColor(category) {
+  return db.JUICE_COLORS[category] || CATEGORY_COLORS[category] || '#4CAF50';
+}
+// Hand-picked section backgrounds for the daily report; any other colour gets a computed tint.
+const CATEGORY_TINTS = { orange: '#fff3e0', yuzu: '#fffde7', pop: '#e1f5fe', mixed: '#f3e5f5', tomato: '#ffebee', pineapple: '#f9fbe7', watermelon: '#fce4ec' };
 const CATEGORY_ICONS = { orange: '🍊', yuzu: '🍋', pop: '🍹', mixed: '🍇', tomato: '🍅', pineapple: '🍍', watermelon: '🍉' };
 const CATEGORY_COLORS = { orange: '#ff9800', yuzu: '#f9a825', pop: '#03a9f4', mixed: '#9c27b0', tomato: '#f44336', pineapple: '#cddc39', watermelon: '#e57373' };
 
@@ -2728,8 +3499,8 @@ function buildReportRow(category, volume, target, yoy) {
     growthCell = `<td style="color:${color};font-weight:600;font-size:16px;">${sign}${pct.toFixed(1)}%</td>`;
   }
   const name = db.CATEGORY_NAMES[category] || category;
-  const icon = CATEGORY_ICONS[category] || '';
-  const color = CATEGORY_COLORS[category] || '#4CAF50';
+  const icon = juiceIcon(category);
+  const color = juiceColor(category);
   return `
     <tr>
       <td style="text-align:left;font-weight:600;color:${color};white-space:nowrap;">${icon} ${escapeHtml(name)}</td>
@@ -2997,8 +3768,8 @@ app.get('/targets', async (req, res) => {
     const rows = ordered.map(c => {
       const current = currentTargets[c] || 0;
       const name = db.CATEGORY_NAMES[c] || c;
-      const icon = CATEGORY_ICONS[c] || '';
-      const color = CATEGORY_COLORS[c] || '#4CAF50';
+      const icon = juiceIcon(c);
+      const color = juiceColor(c);
       return `
         <tr>
           <td style="text-align:left;font-weight:600;color:${color};">${icon} ${escapeHtml(name)}</td>
@@ -4010,6 +4781,7 @@ if (process.env.NODE_ENV !== 'test') {
 module.exports = {
   getRowProductValue,
   detectProductColumns,
+  detectUnknownJuiceColumns,
   buildTablesFromResult,
   validateTableData,
   detectCrateColumns,

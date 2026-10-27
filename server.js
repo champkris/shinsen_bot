@@ -8,7 +8,6 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const https = require('https');
-const crypto = require('crypto');
 const db = require('./db');
 
 // Debug logging to file
@@ -1615,8 +1614,7 @@ const app = express();
 
 // Logging middleware
 app.use((req, res, next) => {
-  // The juice page's token is its only protection — keep it out of the logs.
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path.replace(/^\/juices\/[^/]+/, '/juices/***')}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
@@ -3082,31 +3080,18 @@ app.post('/test-ocr', express.raw({ type: 'image/*', limit: '10mb' }), async (re
   }
 });
 
-// ---------- Juice page (linked only from dev alerts) ----------
+// ---------- Juice page (/juice) ----------
 
-// No login: the page is reached only through the link in dev alerts. Its token is derived
-// from the LINE channel secret — stable across restarts, nothing to configure on Plesk —
-// and a wrong token gets a plain 404, as if the page didn't exist.
-const JUICE_PAGE_TOKEN = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET || '')
-  .update('juice-page').digest('hex').slice(0, 24);
+// Open like /targets: no login, so it is always one bookmark away. Anyone with the URL can
+// rename, merge or delete juices — accepted by the owner; merge and delete ask to confirm.
+const JUICE_PAGE = '/juice';
 
 function juicePageUrl() {
-  return `https://shinsen.yushi-marketing.com/juices/${JUICE_PAGE_TOKEN}`;
-}
-
-function requireJuiceToken(req, res, next) {
-  const given = Buffer.from(String(req.params.token || ''));
-  const expected = Buffer.from(JUICE_PAGE_TOKEN);
-  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
-    return res.sendStatus(404);
-  }
-  // The token is in the URL; don't hand it to anything the page links to.
-  res.set('Referrer-Policy', 'no-referrer');
-  next();
+  return `https://shinsen.yushi-marketing.com${JUICE_PAGE}`;
 }
 
 function backToJuicePage(res, msg) {
-  res.redirect(303, `/juices/${JUICE_PAGE_TOKEN}?msg=${encodeURIComponent(msg)}`);
+  res.redirect(303, `${JUICE_PAGE}?msg=${encodeURIComponent(msg)}`);
 }
 
 // Icons a juice can be given on the juice page. A fixed list rather than free text: the value
@@ -3150,7 +3135,7 @@ function colorFromForm(value, fallback = null) {
 }
 
 function renderJuicePage({ pendings, customs, stats, msg }) {
-  const base = `/juices/${JUICE_PAGE_TOKEN}`;
+  const base = JUICE_PAGE;
   const detection = getProductDetection();
   const mergeTargets = Object.values(detection).map(d => d.dbCategory);
   const customByCategory = Object.fromEntries(customs.map(c => [c.category, c]));
@@ -3269,7 +3254,7 @@ function renderJuicePage({ pendings, customs, stats, msg }) {
 </html>`;
 }
 
-app.get('/juices/:token', requireJuiceToken, async (req, res) => {
+app.get(JUICE_PAGE, async (req, res) => {
   try {
     await refreshCategories();
     const [pendings, customs, stats] = await Promise.all([
@@ -3285,7 +3270,7 @@ app.get('/juices/:token', requireJuiceToken, async (req, res) => {
 });
 
 // Name a column that couldn't be added on its own, and record it.
-app.post('/juices/:token/pending/:id/add', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/pending/:id/add`, async (req, res) => {
   try {
     const pending = await db.getPendingJuice(parseInt(req.params.id, 10));
     if (!pending || pending.status !== 'pending') return backToJuicePage(res, 'รายการนี้ถูกจัดการไปแล้ว');
@@ -3304,7 +3289,7 @@ app.post('/juices/:token/pending/:id/add', requireJuiceToken, async (req, res) =
   }
 });
 
-app.post('/juices/:token/pending/:id/ignore', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/pending/:id/ignore`, async (req, res) => {
   try {
     const ok = await db.resolvePendingJuice(parseInt(req.params.id, 10), 'ignored', null, 'web');
     backToJuicePage(res, ok ? 'ทิ้งรายการแล้ว ยอดนี้จะไม่ถูกบันทึก' : 'รายการนี้ถูกจัดการไปแล้ว');
@@ -3338,7 +3323,7 @@ async function updateBuiltinJuice(category, body) {
 
 // Fix the names, colour or icon of a juice. For an auto-added one a corrected Thai name joins
 // its keywords rather than replacing them: tomorrow's plan may still be read the old way.
-app.post('/juices/:token/category/:category/update', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/category/:category/update`, async (req, res) => {
   try {
     await refreshCategories();
     const category = req.params.category;
@@ -3368,7 +3353,7 @@ app.post('/juices/:token/category/:category/update', requireJuiceToken, async (r
   }
 });
 
-app.post('/juices/:token/category/:category/reset', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/category/:category/reset`, async (req, res) => {
   try {
     const category = req.params.category;
     if (!db.BUILTIN_CATEGORIES.includes(category)) return backToJuicePage(res, '❌ คืนค่าเดิมได้เฉพาะน้ำหลักในระบบ');
@@ -3381,7 +3366,7 @@ app.post('/juices/:token/category/:category/reset', requireJuiceToken, async (re
   }
 });
 
-app.post('/juices/:token/category/:category/merge', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/category/:category/merge`, async (req, res) => {
   try {
     await refreshCategories();
     const from = req.params.category;
@@ -3404,7 +3389,7 @@ app.post('/juices/:token/category/:category/merge', requireJuiceToken, async (re
   }
 });
 
-app.post('/juices/:token/category/:category/delete', requireJuiceToken, async (req, res) => {
+app.post(`${JUICE_PAGE}/category/:category/delete`, async (req, res) => {
   try {
     await refreshCategories();
     const category = req.params.category;
